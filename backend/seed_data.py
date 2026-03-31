@@ -117,9 +117,10 @@ async def seed():
         ingredients_def = _build_ingredients()
 
         names = [d["name"] for d in ingredients_def]
-        existing_names = set(
-            (await db.execute(select(Ingredient.name).where(Ingredient.name.in_(names)))).scalars().all()
-        )
+        existing_rows = (
+            await db.execute(select(Ingredient).where(Ingredient.name.in_(names)))
+        ).scalars().all()
+        existing_names = {row.name for row in existing_rows}
 
         to_add = [
             Ingredient(**d)
@@ -128,6 +129,20 @@ async def seed():
         ]
         if to_add:
             db.add_all(to_add)
+            await db.commit()
+
+        # По запросу: добавить +1000 единиц к каждому ингредиенту (с ограничением <= 5000).
+        # Делаем это после upsert, чтобы охватить все записи.
+        all_rows = (
+            await db.execute(select(Ingredient).where(Ingredient.name.in_(names)))
+        ).scalars().all()
+        updated_any = False
+        for row in all_rows:
+            new_qty = _clamp_qty(float(row.quantity or 0.0) + 1000.0)
+            if new_qty != float(row.quantity or 0.0):
+                row.quantity = new_qty
+                updated_any = True
+        if updated_any:
             await db.commit()
 
         # Получаем ID добавленных ингредиентов

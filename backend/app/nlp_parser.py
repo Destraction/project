@@ -85,6 +85,7 @@ class PreferenceParser:
             "base": "вода",
             "desired_terms": [],
             "avoid_terms": [],
+            "_explicit_fields": [],
         }
 
     def _normalize_token(self, token: str) -> str:
@@ -118,11 +119,13 @@ class PreferenceParser:
         normalized_tokens = self._tokenize(text_norm)
         prefs["desired_terms"] = []
         prefs["avoid_terms"] = []
+        prefs["_explicit_fields"] = []
 
         # База: ищем по ключевым словам/подстрокам
         for needle, base_value in self.base_map.items():
             if self._contains_meaning(normalized_tokens, needle) or needle in text_norm:
                 prefs["base"] = base_value
+                prefs["_explicit_fields"].append("base")
                 break
 
         # Весовые признаки по ключевым словам (используем подстрочный поиск)
@@ -132,12 +135,40 @@ class PreferenceParser:
                 if self._contains_meaning(normalized_tokens, word) or word in text_norm:
                     best = max(best, weight)
             prefs[feature] = best
+            if best > self.default_prefs.get(feature, 0.0):
+                prefs["_explicit_fields"].append(feature)
 
         # Пряность
         spice_markers = ["пряный", "прян", "имбир", "перец", "кориц", "кардамон"]
         spice_hit = any(self._contains_meaning(normalized_tokens, m) or m in text_norm for m in spice_markers)
         if spice_hit:
             prefs["spice"] = max(float(prefs.get("spice", 0.2)), 0.75)
+            prefs["_explicit_fields"].append("spice")
+
+        # Явные шкалы 1-10: "сладость 7/10", "кислотность 3/10", "7/10"
+        def clamp10(v: int) -> float:
+            return max(0.0, min(1.0, v / 10.0))
+
+        # Пары формата "сладость 7/10" / "кислотность 4/10"
+        sweet_match = re.search(r"(слад\w*)\D{0,8}(\d{1,2})\s*/\s*10", text_norm)
+        sour_match = re.search(r"(кисл\w*|кислот\w*)\D{0,8}(\d{1,2})\s*/\s*10", text_norm)
+        if sweet_match:
+            prefs["sweetness"] = clamp10(int(sweet_match.group(2)))
+            prefs["_explicit_fields"].append("sweetness")
+        if sour_match:
+            prefs["sourness"] = clamp10(int(sour_match.group(2)))
+            prefs["_explicit_fields"].append("sourness")
+
+        # Если просто "7/10" без уточнения — считаем это общей интенсивностью:
+        plain_scale = re.findall(r"(\d{1,2})\s*/\s*10", text_norm)
+        if plain_scale:
+            val = clamp10(int(plain_scale[0]))
+            if "sweetness" not in prefs["_explicit_fields"]:
+                prefs["sweetness"] = val
+                prefs["_explicit_fields"].append("sweetness")
+            if "sourness" not in prefs["_explicit_fields"]:
+                prefs["sourness"] = val
+                prefs["_explicit_fields"].append("sourness")
 
         # Извлекаем явные ограничения "без X"
         for m in re.findall(r"без\s+([а-яa-zё0-9\s\-]{2,30})", text_norm):
@@ -160,6 +191,7 @@ class PreferenceParser:
         # Дедуп
         prefs["desired_terms"] = list(dict.fromkeys(prefs["desired_terms"]))
         prefs["avoid_terms"] = list(dict.fromkeys(prefs["avoid_terms"]))
+        prefs["_explicit_fields"] = list(dict.fromkeys(prefs["_explicit_fields"]))
 
         # Небольшая нормализация
         prefs["sweetness"] = float(prefs["sweetness"])

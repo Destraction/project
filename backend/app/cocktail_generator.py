@@ -80,7 +80,7 @@ class CocktailGenerator:
         if float(base.quantity) < base_qty:
             # Ищем другую base с достаточным остатком
             base_candidates = await self._get_ingredients_by_category("base")
-            base2 = self._find_ingredient_with_enough(base_candidates, "base", base_qty)
+            base2 = await self._find_ingredient_with_enough(base_candidates, "base", base_qty)
             if not base2:
                 return None
             base = base2
@@ -95,7 +95,7 @@ class CocktailGenerator:
         if float(main.quantity) < main_qty:
             # Пробуем выбрать другой main с достаточным остатком
             main_candidates = await self._get_ingredients_by_category(main_category)
-            main2 = self._find_ingredient_with_enough(main_candidates, "main", main_qty)
+            main2 = await self._find_ingredient_with_enough(main_candidates, "main", main_qty)
             if not main2:
                 return None
             main = main2
@@ -498,11 +498,14 @@ class CocktailGenerator:
                     for key in list(recipe.keys()):
                         recipe[key] = round(float(recipe[key]) * factor, 1)
 
-        # Проверка остатков
+        # Строгая проверка остатков
         for ing_id_str, qty in recipe.items():
             ing = await self._get_ingredient_by_id(int(ing_id_str))
-            if not ing or float(ing.quantity) < float(qty):
-                continue
+            if not ing:
+                return cocktail_data
+            if float(ing.quantity) < float(qty):
+                # Откат к предыдущему варианту без изменения рецепта
+                return cocktail_data
 
         details = await self.build_recipe_details(recipe)
         totals = self.calculate_totals(details)

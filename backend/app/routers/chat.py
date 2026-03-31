@@ -1,13 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any, Dict
 
 from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.conversation_agent import RussianBartenderAgent
 from app.cocktail_generator import CocktailGenerator
+from app.free_llm_client import FreeLLMBartender
 from app.crud import confirm_order, create_order, save_dialogue_message
 from app.database import get_db
 from app.models import GeneratedCocktail
@@ -32,6 +33,8 @@ def _new_state() -> Dict[str, Any]:
             "spice": 0.2,
             "base": "вода",
             "ice": True,
+            "desired_terms": [],
+            "avoid_terms": [],
         },
         "profile": {
             "mood": None,
@@ -51,10 +54,11 @@ def _new_state() -> Dict[str, Any]:
 
 
 def _merge_prefs(dst: Dict[str, Any], src: Dict[str, Any]) -> None:
+    explicit = set(src.get("_explicit_fields", []))
     for key in ("sweetness", "sourness", "fruitiness", "citrus", "mint", "spice"):
-        if key in src:
+        if key in src and key in explicit:
             dst[key] = max(0.0, min(1.0, float(src[key])))
-    if src.get("base"):
+    if src.get("base") and "base" in explicit:
         dst["base"] = src["base"]
     if "desired_terms" in src:
         old = dst.get("desired_terms", [])
@@ -76,6 +80,10 @@ def _parse_meta_preferences(text: str, state: Dict[str, Any]) -> None:
         "романт": "romantic",
         "вечерин": "party",
         "освеж": "fresh",
+        "жив": "energized",
+        "легк": "relaxed",
+        "мягк": "relaxed",
+        "ярк": "party",
     }
     for k, mood in mood_map.items():
         if k in t:
@@ -104,13 +112,24 @@ def _parse_meta_preferences(text: str, state: Dict[str, Any]) -> None:
     if "газирован" in t or "сода" in t:
         prefs["base"] = "газированная вода"
         state["collected"]["base"] = True
+    if "газиров" in t or "пузыр" in t:
+        prefs["base"] = "газированная вода"
+        state["collected"]["base"] = True
     if "негазир" in t:
+        prefs["base"] = "вода"
+        state["collected"]["base"] = True
+    if "обычн" in t and "вода" in t:
         prefs["base"] = "вода"
         state["collected"]["base"] = True
 
     # Маркеры что вкусовые предпочтения указаны
     if any(x in t for x in ["слад", "кисл", "мят", "цитрус", "фрукт", "прян", "лайм", "лимон"]):
         state["collected"]["taste"] = True
+
+    # Если настроение не распознано по словарю, но ответ осмысленный — всё равно фиксируем.
+    if not state["collected"]["mood"] and len(t.strip()) >= 4:
+        profile["mood"] = t.strip()
+        state["collected"]["mood"] = True
 
 
 def _need_more_questions(state: Dict[str, Any]) -> bool:
@@ -121,12 +140,12 @@ def _need_more_questions(state: Dict[str, Any]) -> bool:
 def _next_question(state: Dict[str, Any]) -> str:
     c = state["collected"]
     if not c["mood"]:
-        return "Какое у вас настроение для напитка: спокойное, бодрящее, романтичное или для вечеринки?"
+        return "Какое настроение у напитка?"
     if not c["base"]:
-        return "Предпочитаете основу на воде или на газированной воде?"
+        return "Основа: вода или газированная?"
     if not c["taste"]:
-        return "По вкусу что ближе: сладкий, кислый, более фруктовый, цитрусовый, мятный или пряный профиль?"
-    return "Хотите добавить ограничения: например, 'без имбиря', 'без льда', 'меньше сладости'?"
+        return "По вкусу куда смещаемся?"
+    return "Есть ограничения?"
 
 
 def _is_start_generation_message(text: str) -> bool:
@@ -142,7 +161,7 @@ def _is_confirm_message(text: str) -> bool:
 
 def _is_adjustment_message(text: str) -> bool:
     t = text.lower().strip()
-    markers = ["добавь", "убери", "удали", "слаще", "менее слад", "меньше слад", "объем", "объём", "без льда", "добавь лёд", "добавь лед"]
+    markers = ["добавь", "убери", "удали", "слаще", "менее слад", "меньше слад", "объем", "объём", "без льда", "добавь лёд", "добавь лед", "/10"]
     return any(m in t for m in markers)
 
 
@@ -155,8 +174,23 @@ async def websocket_endpoint(
     await manager.connect(session_id, websocket)
     parser = PreferenceParser()
     generator = CocktailGenerator(db)
-    convo = RussianBartenderAgent()
+    llm = FreeLLMBartender()
     SESSION_STATE[session_id] = _new_state()
+
+    async def ask_llm(prompt: str, state_obj: Dict[str, Any]) -> str:
+        try:
+            return await asyncio.wait_for(
+                llm.reply(
+                    db=db,
+                    user_message=prompt,
+                    state=state_obj,
+                    fallback_text="",
+                    strict_json=False,
+                ),
+                timeout=20.0,
+            )
+        except Exception:
+            return "Я на связи, но модель отвечает медленно. Напиши ещё раз через пару секунд."
 
     # Приветствие
     await manager.send_message(
@@ -164,13 +198,18 @@ async def websocket_endpoint(
         json.dumps(
             {
                 "type": "system",
-                "content": convo.greet(),
+                "content": await ask_llm("Начало диалога с гостем. Коротко поздоровайся и спроси, как прошел день.", SESSION_STATE[session_id]),
             },
         ),
     )
     await manager.send_message(
         session_id,
-        json.dumps({"type": "assistant", "content": convo.next_question(SESSION_STATE[session_id])}),
+        json.dumps(
+            {
+                "type": "assistant",
+                "content": await ask_llm("Задай первый уточняющий вопрос по напитку.", SESSION_STATE[session_id]),
+            }
+        ),
     )
 
     try:
@@ -196,7 +235,12 @@ async def websocket_endpoint(
                     await db.commit()
                 await manager.send_message(
                     session_id,
-                    json.dumps({"type": "success", "content": "Спасибо! Оценка сохранена. Могу предложить следующий напиток под новое настроение."}),
+                    json.dumps(
+                        {
+                            "type": "success",
+                            "content": await ask_llm("Гость оставил оценку. Ответь тепло и предложи следующий напиток.", state),
+                        }
+                    ),
                 )
                 state["phase"] = "discovery"
                 state["draft"] = None
@@ -205,7 +249,12 @@ async def websocket_endpoint(
                 state["collected"] = {"taste": False, "mood": False, "base": False, "extras": False}
                 await manager.send_message(
                     session_id,
-                    json.dumps({"type": "assistant", "content": _next_question(state)}),
+                    json.dumps(
+                        {
+                            "type": "assistant",
+                            "content": await ask_llm("Продолжи диалог и собери новые пожелания для следующего напитка.", state),
+                        }
+                    ),
                 )
                 SESSION_STATE[session_id] = state
                 continue
@@ -228,28 +277,28 @@ async def websocket_endpoint(
                     if not success:
                         await manager.send_message(
                             session_id,
-                            json.dumps({"type": "error", "content": "Не удалось подтвердить заказ (недостаточно ингредиентов). Давайте скорректируем рецепт."}),
+                            json.dumps(
+                                {
+                                    "type": "error",
+                                    "content": await ask_llm("Заказ не подтвердился из-за остатков. Коротко предложи поправить рецепт.", state),
+                                }
+                            ),
                         )
                         continue
                     state["pending_order_id"] = order.id
                     state["pending_cocktail_id"] = new_cocktail.id
                     state["phase"] = "awaiting_rating"
+                    success_text = await ask_llm("Сообщи, что заказ подтверждён, и попроси оценку 1-5.", state)
                     await manager.send_message(
                         session_id,
-                        json.dumps(
-                            {
-                                "type": "success",
-                                "content": (
-                                    "Заказ подтверждён и отправлен в приготовление.\n"
-                                    "После дегустации оцените напиток от 1 до 5."
-                                ),
-                            }
-                        ),
+                        json.dumps({"type": "success", "content": success_text}),
                     )
                     SESSION_STATE[session_id] = state
                     continue
 
                 if _is_adjustment_message(user_msg):
+                    parsed_adj = parser.parse(user_msg)
+                    _merge_prefs(state["prefs"], parsed_adj)
                     state["draft"] = await generator.adjust_recipe(state["draft"], user_msg, state["prefs"])
                     card = generator.format_recipe_card(state["draft"])
                     await manager.send_message(session_id, json.dumps({"type": "recommendation", "message": card}))
@@ -262,11 +311,7 @@ async def websocket_endpoint(
                     json.dumps(
                         {
                             "type": "assistant",
-                            "content": (
-                                "Если хотите изменения — напишите, например, 'добавь мяту', 'убери сироп', "
-                                "'сделай менее сладким', 'без льда' или 'объем 350 мл'. "
-                                "Если всё устраивает — напишите 'подтвердить'."
-                            ),
+                            "content": await ask_llm(user_msg, state),
                         }
                     ),
                 )
@@ -283,7 +328,7 @@ async def websocket_endpoint(
                     json.dumps(
                         {
                             "type": "assistant",
-                            "content": f"{convo.ack()} {convo.next_question(state)}",
+                            "content": await ask_llm(user_msg, state),
                         }
                     ),
                 )
@@ -297,7 +342,10 @@ async def websocket_endpoint(
                     json.dumps(
                         {
                             "type": "error",
-                            "content": "Сейчас не смог собрать сбалансированный вариант из доступных ингредиентов. Давайте уточним пожелания: можно менее кислый или без ограничений?",
+                            "content": await ask_llm(
+                                "Не удалось собрать коктейль из остатков. Задай несколько уточняющих вопросов и предложи другой вариант.",
+                                state,
+                            ),
                         }
                     ),
                 )
@@ -308,12 +356,22 @@ async def websocket_endpoint(
             state["phase"] = "draft_ready"
             await manager.send_message(
                 session_id,
-                json.dumps({"type": "assistant", "content": f"{convo.ack()} {convo.draft_intro()}"}),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "content": await ask_llm("Представь вариант напитка по-дружески и коротко.", state),
+                    }
+                ),
             )
             await manager.send_message(session_id, json.dumps({"type": "recommendation", "message": card}))
             await manager.send_message(
                 session_id,
-                json.dumps({"type": "assistant", "content": convo.adjustment_hint()}),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "content": await ask_llm("Спроси, хочет ли гость что-то изменить перед подтверждением.", state),
+                    }
+                ),
             )
             await save_dialogue_message(db, session_id, "assistant", card)
             SESSION_STATE[session_id] = state
