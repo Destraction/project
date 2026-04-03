@@ -13,13 +13,15 @@ from app.models import Compatibility, Ingredient
 
 class FreeLLMBartender:
     """
-    Бесплатная локальная модель через Ollama.
+    Клиент для общения с моделью бармена.
     """
 
     def __init__(self) -> None:
-        self.enabled = bool(settings.ENABLE_OLLAMA)
-        self.base_url = settings.OLLAMA_BASE_URL.rstrip("/")
-        self.model = settings.OLLAMA_MODEL
+        self.enabled_chad = bool(getattr(settings, "ENABLE_CHAD", False)) and bool(getattr(settings, "CHAD_API_KEY", ""))
+        self.chad_api_key = getattr(settings, "CHAD_API_KEY", "")
+        self.chad_model = getattr(settings, "CHAD_MODEL", "gpt-5.4-mini")
+        self.chad_endpoint = f"https://ask.chadgpt.ru/api/public/{self.chad_model}"
+
         self.min_required_by_unit = {"ml": 30.0, "g": 10.0, "piece": 1.0}
 
     async def build_bar_context(self, db: AsyncSession) -> Dict[str, Any]:
@@ -79,10 +81,8 @@ class FreeLLMBartender:
         fallback_text: str,
         strict_json: bool = False,
     ) -> str:
-        technical_fallback = (
-            "Локальная модель недоступна. Запусти Ollama и скачай модель, затем повтори сообщение."
-        )
-        if not self.enabled:
+        technical_fallback = "Модель Chad недоступна (не задан `CHAD_API_KEY` или выключен `ENABLE_CHAD`)."
+        if not self.enabled_chad:
             return fallback_text or technical_fallback
 
         context = await self.build_bar_context(db)
@@ -96,7 +96,11 @@ class FreeLLMBartender:
             "Говори по-русски, тепло и естественно, как приятель. "
             "Учитывай контекст доступных ингредиентов и сочетаемость. "
             "Не предлагай ингредиенты, которых нет в остатках. "
-            "Задавай уточняющие вопросы по вкусу и настроению."
+            "Задавай уточняющие вопросы по вкусу и настроению. "
+            "Режим `discovery`: НЕ предлагай готовый рецепт и не “собирай коктейль за гостя”; только задавай 1 вопрос за раз и помогай гостю выбрать, что он хочет добавить. "
+            "Профессионально балансируй сладость и кислотность: если гость просит 'слаще' или 'менее сладко' — речь про увеличение/уменьшение сладких ингредиентов (сиропов); "
+            "если просит 'кислее' или 'менее кислым' — речь про увеличение/уменьшение кислых ингредиентов (соков/кислых компонентов). "
+            "Если в диалоге появляются правки, отвечай кратко и по делу: подтверждай действие и предлагай гостю проверить перед подтверждением заказа."
         )
         if strict_json:
             system_prompt += (
@@ -114,23 +118,29 @@ class FreeLLMBartender:
 
         try:
             async with httpx.AsyncClient(timeout=45.0) as client:
-                resp = await client.post(
-                    f"{self.base_url}/api/chat",
-                    json={
-                        "model": self.model,
-                        "stream": False,
-                        "messages": [
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
-                        ],
-                        "options": {"temperature": 0.7},
-                    },
-                )
+                req_json: Dict[str, Any] = {
+                    "message": json.dumps(
+                        {
+                            "user_payload": user_payload,
+                            "user_message": user_message,
+                            "phase": phase,
+                            "strict_json": strict_json,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    "api_key": self.chad_api_key,
+                    "history": [{"role": "system", "content": system_prompt}],
+                }
+                resp = await client.post(url=self.chad_endpoint, json=req_json)
                 resp.raise_for_status()
                 data = resp.json()
-                content = str(data.get("message", {}).get("content", "")).strip()
+                if not data.get("is_success", False):
+                    return fallback_text or str(data.get("error_message") or technical_fallback)
+
+                content = str(data.get("response", "")).strip()
                 if not content:
                     return fallback_text or technical_fallback
+
                 if strict_json:
                     try:
                         parsed = json.loads(content)
@@ -139,6 +149,7 @@ class FreeLLMBartender:
                     if not self._validate_json_payload(parsed, allowed_set):
                         return fallback_text or technical_fallback
                     return str(parsed.get("reply") or fallback_text)
+
                 return content
         except Exception:
             return fallback_text or technical_fallback

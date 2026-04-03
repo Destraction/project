@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import random
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -12,6 +13,13 @@ from app.models import Ingredient, Compatibility
 class CocktailGenerator:
     def __init__(self, db: AsyncSession) -> None:
         self.db = db
+
+        # Пороговые "референсы" для перевода количества ингредиентов в шкалу 1..10 вкусов.
+        # Это нужно, чтобы карточка менялась согласованно с тем, что вы реально правите
+        # (кислые/сладкие компоненты -> изменяются объёмы в recipe).
+        self.sweet_reference_ml = 60.0   # условные "максимально сладко"
+        self.sour_reference_ml = 90.0    # условные "максимально кисло"
+
         # Упрощённая нутриционная база (на 100 ml / 100 g / 1 piece)
         self.nutrition_reference = {
             "base": {"kcal": 0.0, "protein": 0.0, "fat": 0.0, "carbs": 0.0},
@@ -141,6 +149,55 @@ class CocktailGenerator:
             "description": description,
             "recipe": recipe,
             "ingredients_details": ingredients_details,
+            "details": details,
+            "totals": totals,
+            "taste_profile": taste_profile,
+        }
+
+    async def create_base_draft(self, prefs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Создаёт "черновик-основу" (только base + опционально лёд),
+        чтобы клиент сам добавлял оставшиеся ингредиенты.
+        """
+        base_name = str(prefs.get("base", "вода"))
+        base = await self._get_ingredient_by_name(base_name)
+        if base and self._is_avoided(base.name, prefs):
+            base = None
+
+        if not base:
+            base_candidates = await self._get_ingredients_by_category("base")
+            base_candidates = [x for x in base_candidates if not self._is_avoided(x.name, prefs)]
+            base = random.choice(base_candidates) if base_candidates else None
+
+        if not base:
+            return None
+
+        base_qty = self._qty_for_unit(base.unit or "ml", "base")
+        if float(base.quantity) < base_qty:
+            # Ищем другую base с достаточным остатком
+            base_candidates = await self._get_ingredients_by_category("base")
+            base2 = await self._find_ingredient_with_enough(base_candidates, "base", base_qty)
+            if not base2:
+                return None
+            base = base2
+
+        recipe: Dict[str, float] = {str(base.id): float(base_qty)}
+
+        if bool(prefs.get("ice", True)):
+            ice = await self._find_first_available_by_category("ice")
+            if ice:
+                ice_qty = 120.0
+                if float(ice.quantity) >= ice_qty:
+                    recipe[str(ice.id)] = ice_qty
+
+        details = await self.build_recipe_details(recipe)
+        totals = self.calculate_totals(details)
+        taste_profile = self.calculate_taste_profile(prefs, details)
+
+        return {
+            "name": "Основа напитка",
+            "description": "Это основа. Теперь добавьте ингредиенты так, как хочется именно вам.",
+            "recipe": recipe,
             "details": details,
             "totals": totals,
             "taste_profile": taste_profile,
@@ -364,9 +421,53 @@ class CocktailGenerator:
         }
 
     def calculate_taste_profile(self, prefs: Dict[str, Any], details: List[Dict[str, Any]]) -> Dict[str, int]:
-        sweetness = min(10, max(1, int(round(float(prefs.get("sweetness", 0.5)) * 10))))
-        sourness = min(10, max(1, int(round(float(prefs.get("sourness", 0.3)) * 10))))
-        freshness = min(10, max(1, int(round((float(prefs.get("citrus", 0.2)) + float(prefs.get("mint", 0.0))) * 5 + 2))))
+        total_syrup_ml = sum(
+            float(x["qty"])
+            for x in details
+            if x.get("category") == "syrup" and (x.get("unit") or "") == "ml"
+        )
+        total_juice_ml = sum(
+            float(x["qty"])
+            for x in details
+            if x.get("category") == "juice" and (x.get("unit") or "") == "ml"
+        )
+
+        # Сладость/кислотность считаем по фактическим объёмам ингредиентов,
+        # чтобы правки вида "слаще/кислее" отражались в карточке.
+        sweet_proxy = min(1.0, max(0.0, total_syrup_ml / max(1e-6, self.sweet_reference_ml)))
+        sour_proxy = min(1.0, max(0.0, total_juice_ml / max(1e-6, self.sour_reference_ml)))
+
+        # Если в рецепте пока нет сиропа/сока (только основа и лёд),
+        # но клиент задал предпочтения — показываем "целевую" шкалу вкуса,
+        # чтобы карточка соответствовала ожиданиям.
+        prefs_sweet = float(prefs.get("sweetness", 0.5))
+        prefs_sour = float(prefs.get("sourness", 0.3))
+        if total_syrup_ml <= 0.01:
+            sweet_proxy = max(sweet_proxy, max(0.0, min(1.0, prefs_sweet)))
+        if total_juice_ml <= 0.01:
+            sour_proxy = max(sour_proxy, max(0.0, min(1.0, prefs_sour)))
+
+        sweetness = min(10, max(1, int(round(sweet_proxy * 10))))
+        sourness = min(10, max(1, int(round(sour_proxy * 10))))
+
+        citrus_keywords = ["лимон", "лайм", "апельсин", "мандар", "грейпфрут", "цедра"]
+        mint_keywords = ["мята", "мят"]
+        citrus_ml = sum(
+            float(x["qty"])
+            for x in details
+            if x.get("category") == "juice"
+            and (x.get("unit") or "") == "ml"
+            and any(k in str(x.get("name", "")).lower() for k in citrus_keywords)
+        )
+        mint_ml = sum(
+            float(x["qty"])
+            for x in details
+            if x.get("category") == "additive"
+            and any(k in str(x.get("name", "")).lower() for k in mint_keywords)
+        )
+        freshness_proxy = min(1.0, (citrus_ml / 120.0) + (mint_ml / 60.0))
+        freshness = min(10, max(1, int(round(freshness_proxy * 10))))
+
         spice = 2
         body = 4
         for item in details:
@@ -427,7 +528,9 @@ class CocktailGenerator:
                 "Если хотите, я изменю состав: напишите, например:",
                 "- 'добавь мяту'",
                 "- 'убери сироп'",
-                "- 'сделай менее сладким'",
+                "- 'сделай слаще' / 'сделай менее сладким'",
+                "- 'сделай кислее' / 'сделай менее кислым'",
+                "- 'сделай прянее' / 'сделай менее пряным'",
                 "- 'без льда'",
                 "- 'объем 350 мл'",
                 "Либо напишите 'подтвердить', чтобы оформить заказ.",
@@ -443,6 +546,28 @@ class CocktailGenerator:
     ) -> Dict[str, Any]:
         text = user_message.lower().strip()
         recipe = dict(cocktail_data.get("recipe", {}))
+
+        # Считываем текущие ингредиенты из recipe (для категорий/единиц измерения).
+        recipe_ids = [int(k) for k in recipe.keys()]
+        ing_map: Dict[int, Ingredient] = {}
+        for ing_id in recipe_ids:
+            ing = await self._get_ingredient_by_id(ing_id)
+            if ing:
+                ing_map[ing_id] = ing
+
+        # Определяем "опорный" ингредиент (самый объёмный не-Base/не-Ice),
+        # чтобы при добавлении новых компонентов учитывать сочетаемость.
+        main_ing_id: Optional[int] = None
+        main_category: Optional[str] = None
+        main_qty = -1.0
+        for ing_id, ing in ing_map.items():
+            if ing.category in {"base", "ice"}:
+                continue
+            qty = float(recipe.get(str(ing_id), 0.0))
+            if qty > main_qty:
+                main_qty = qty
+                main_ing_id = ing_id
+                main_category = ing.category
 
         # Без льда / добавить лёд
         if "без льда" in text:
@@ -470,20 +595,182 @@ class CocktailGenerator:
             if ing:
                 recipe.pop(str(ing.id), None)
 
-        # Управление сладостью (через сиропы)
-        if "менее слад" in text or "меньше слад" in text:
-            for item in list(recipe.keys()):
-                ing = await self._get_ingredient_by_id(int(item))
-                if ing and ing.category == "syrup":
-                    recipe[item] = max(0.0, float(recipe[item]) - 10.0)
-                    if recipe[item] <= 0.0:
-                        recipe.pop(item, None)
-            prefs["sweetness"] = max(0.1, float(prefs.get("sweetness", 0.5)) - 0.2)
-        if "слаще" in text or "больше слад" in text:
-            prefs["sweetness"] = min(1.0, float(prefs.get("sweetness", 0.5)) + 0.2)
-            syrup = await self._find_first_available_by_category("syrup")
-            if syrup:
-                recipe[str(syrup.id)] = float(recipe.get(str(syrup.id), 0.0)) + 10.0
+        async def _pick_available_candidate(category: str, min_qty: float) -> Optional[Ingredient]:
+            """
+            Выбираем ближайший подходящий ингредиент из категории,
+            учитывая остаток, avoid_terms и сочетаемость (если есть main_ing_id).
+            """
+            candidates = await self._get_ingredients_by_category(category)
+            candidates = [
+                c
+                for c in candidates
+                if float(c.quantity or 0.0) >= float(min_qty)
+                and not self._is_avoided(c.name or "", prefs)
+            ]
+            if not candidates:
+                return None
+            if main_ing_id is None or not main_category:
+                # Нет "главного" ингредиента для совместимости — выбираем лучший по предпочтениям.
+                scored0: List[Tuple[int, Ingredient]] = []
+                for c in candidates[:30]:
+                    scored0.append((self._preference_score(c, prefs), c))
+                scored0.sort(key=lambda x: x[0], reverse=True)
+                return scored0[0][1] if scored0 else candidates[0]
+
+            # Считаем совместимость только для первых N кандидатов ради скорости.
+            scored: List[Tuple[int, Ingredient]] = []
+            for c in candidates[:15]:
+                score = await self._compat_score(main_ing_id, c.id)
+                if score is None:
+                    score = self._category_compat_score(main_category, c.category or category)
+                if score <= 0:
+                    score = 1
+                scored.append((score * 10 + self._preference_score(c, prefs), c))
+            scored.sort(key=lambda x: x[0], reverse=True)
+            return scored[0][1] if scored else candidates[0]
+
+        sweet_match = re.search(r"(слад\w*)\D{0,8}(\d{1,2})\s*/\s*10", text)
+        sour_match = re.search(r"(кисл\w*|кислот\w*)\D{0,8}(\d{1,2})\s*/\s*10", text)
+
+        less_sweet = "менее слад" in text or "меньше слад" in text
+        more_sweet = "слаще" in text or "больше слад" in text
+        less_sour = (
+            "менее кисл" in text
+            or "меньше кисл" in text
+            or "менее кислот" in text
+            or "убери кис" in text
+            or "убери кислот" in text
+        )
+        more_sour = "кислее" in text or "более кисл" in text or "больше кисл" in text or "сделай кис" in text
+
+        less_mint = "меньше мят" in text or "менее мят" in text or "убери мят" in text
+        more_mint = "больше мят" in text or "добавь мят" in text or "мятнее" in text or "мятный" in text
+
+        spice_keywords = ["пря", "имбир", "перец", "кориц", "кардамон", "гвозд", "мускат", "чили", "куркум", "бадьян"]
+        more_spice = any(k in text for k in ["сделай прянее", "более пря", "больше прян"]) or ("пряный" in text and "менее" not in text)
+        less_spice = any(k in text for k in ["менее пря", "меньше пря", "менее прян", "убери пря"])  # basic
+
+        syrup_ids = [i for i, ing in ing_map.items() if ing.category == "syrup"]
+        juice_ids = [i for i, ing in ing_map.items() if ing.category == "juice"]
+
+        total_syrup_ml = sum(float(recipe.get(str(i), 0.0)) for i in syrup_ids)
+        total_juice_ml = sum(float(recipe.get(str(i), 0.0)) for i in juice_ids)
+
+        def clamp01(v: float) -> float:
+            return max(0.0, min(1.0, float(v)))
+
+        # --- СЛАДОСТЬ ---
+        if sweet_match:
+            desired = int(sweet_match.group(2)) / 10.0
+            target_syrup_ml = desired * self.sweet_reference_ml
+            if total_syrup_ml <= 0.01 and target_syrup_ml > 0.5:
+                syrup = await _pick_available_candidate("syrup", min_qty=10.0)
+                if syrup:
+                    recipe[str(syrup.id)] = round(min(float(syrup.quantity or 0.0), target_syrup_ml), 1)
+            else:
+                factor = target_syrup_ml / max(0.01, total_syrup_ml)
+                factor = max(0.4, min(2.2, factor))
+                for ing_id in syrup_ids:
+                    recipe[str(ing_id)] = round(float(recipe.get(str(ing_id), 0.0)) * factor, 1)
+        elif less_sweet:
+            prefs["sweetness"] = clamp01(float(prefs.get("sweetness", 0.5)) - 0.15)
+            target_syrup_ml = float(prefs["sweetness"]) * self.sweet_reference_ml
+            if syrup_ids:
+                if target_syrup_ml < 5.0:
+                    for ing_id in syrup_ids:
+                        recipe.pop(str(ing_id), None)
+                else:
+                    factor = target_syrup_ml / max(0.01, total_syrup_ml)
+                    factor = max(0.2, min(2.2, factor))
+                    for ing_id in syrup_ids:
+                        recipe[str(ing_id)] = round(float(recipe.get(str(ing_id), 0.0)) * factor, 1)
+        elif more_sweet:
+            prefs["sweetness"] = clamp01(float(prefs.get("sweetness", 0.5)) + 0.15)
+            target_syrup_ml = float(prefs["sweetness"]) * self.sweet_reference_ml
+            if syrup_ids:
+                factor = target_syrup_ml / max(0.01, total_syrup_ml)
+                factor = max(0.4, min(2.2, factor))
+                for ing_id in syrup_ids:
+                    recipe[str(ing_id)] = round(float(recipe.get(str(ing_id), 0.0)) * factor, 1)
+            else:
+                min_qty = 10.0 if target_syrup_ml < 25.0 else 30.0
+                syrup = await _pick_available_candidate("syrup", min_qty=min_qty)
+                if syrup is None and min_qty > 10.0:
+                    syrup = await _pick_available_candidate("syrup", min_qty=10.0)
+                if syrup:
+                    recipe[str(syrup.id)] = round(min(float(syrup.quantity or 0.0), target_syrup_ml), 1)
+
+        # --- КИСЛОТНОСТЬ ---
+        if sour_match:
+            desired = int(sour_match.group(2)) / 10.0
+            target_juice_ml = desired * self.sour_reference_ml
+            if total_juice_ml <= 0.01 and target_juice_ml > 0.5:
+                juice = await _pick_available_candidate("juice", min_qty=10.0)
+                if juice:
+                    recipe[str(juice.id)] = round(min(float(juice.quantity or 0.0), target_juice_ml), 1)
+            else:
+                factor = target_juice_ml / max(0.01, total_juice_ml)
+                factor = max(0.4, min(2.2, factor))
+                for ing_id in juice_ids:
+                    recipe[str(ing_id)] = round(float(recipe.get(str(ing_id), 0.0)) * factor, 1)
+        elif less_sour:
+            prefs["sourness"] = clamp01(float(prefs.get("sourness", 0.3)) - 0.15)
+            target_juice_ml = float(prefs["sourness"]) * self.sour_reference_ml
+            if juice_ids:
+                if target_juice_ml < 5.0:
+                    for ing_id in juice_ids:
+                        recipe.pop(str(ing_id), None)
+                else:
+                    factor = target_juice_ml / max(0.01, total_juice_ml)
+                    factor = max(0.2, min(2.2, factor))
+                    for ing_id in juice_ids:
+                        recipe[str(ing_id)] = round(float(recipe.get(str(ing_id), 0.0)) * factor, 1)
+        elif more_sour:
+            prefs["sourness"] = clamp01(float(prefs.get("sourness", 0.3)) + 0.15)
+            target_juice_ml = float(prefs["sourness"]) * self.sour_reference_ml
+            if juice_ids:
+                factor = target_juice_ml / max(0.01, total_juice_ml)
+                factor = max(0.4, min(2.2, factor))
+                for ing_id in juice_ids:
+                    recipe[str(ing_id)] = round(float(recipe.get(str(ing_id), 0.0)) * factor, 1)
+            else:
+                min_qty = 10.0 if target_juice_ml < 25.0 else 30.0
+                juice = await _pick_available_candidate("juice", min_qty=min_qty)
+                if juice is None and min_qty > 10.0:
+                    juice = await _pick_available_candidate("juice", min_qty=10.0)
+                if juice:
+                    recipe[str(juice.id)] = round(min(float(juice.quantity or 0.0), target_juice_ml), 1)
+
+        # --- МЯТА (свежесть) ---
+        mint_ids = [i for i, ing in ing_map.items() if ing.category == "additive" and any(k in str(ing.name or "").lower() for k in ["мята", "мят"])]
+        if less_mint and mint_ids:
+            for ing_id in mint_ids:
+                step = self._qty_for_unit(ing_map[ing_id].unit or "ml", role="extra") if ing_map.get(ing_id) else 10.0
+                recipe[str(ing_id)] = round(max(0.0, float(recipe.get(str(ing_id), 0.0)) - float(step)), 1)
+                if recipe[str(ing_id)] <= 0.01:
+                    recipe.pop(str(ing_id), None)
+        elif more_mint:
+            step = 10.0
+            mint = await self.find_ingredient_by_name_like("мята")
+            if mint and float(mint.quantity or 0.0) >= step and not self._is_avoided(mint.name or "", prefs):
+                recipe[str(mint.id)] = round(float(recipe.get(str(mint.id), 0.0)) + step, 1)
+
+        # --- ПРЯНОСТЬ ---
+        spice_ids = [
+            i
+            for i, ing in ing_map.items()
+            if ing.category == "additive" and any(k in str(ing.name or "").lower() for k in spice_keywords)
+        ]
+        if more_spice and spice_ids:
+            primary = max(spice_ids, key=lambda i: float(recipe.get(str(i), 0.0)))
+            step = self._qty_for_unit(ing_map[primary].unit or "ml", role="extra") if ing_map.get(primary) else 10.0
+            recipe[str(primary)] = round(float(recipe.get(str(primary), 0.0)) + float(step), 1)
+        elif less_spice and spice_ids:
+            for ing_id in spice_ids:
+                step = self._qty_for_unit(ing_map[ing_id].unit or "ml", role="extra")
+                recipe[str(ing_id)] = round(max(0.0, float(recipe.get(str(ing_id), 0.0)) - float(step)), 1)
+                if recipe[str(ing_id)] <= 0.01:
+                    recipe.pop(str(ing_id), None)
 
         # Масштабирование объема
         if "объем" in text or "объём" in text:
@@ -499,13 +786,16 @@ class CocktailGenerator:
                         recipe[key] = round(float(recipe[key]) * factor, 1)
 
         # Строгая проверка остатков
-        for ing_id_str, qty in recipe.items():
+        for ing_id_str in list(recipe.keys()):
             ing = await self._get_ingredient_by_id(int(ing_id_str))
             if not ing:
                 return cocktail_data
-            if float(ing.quantity) < float(qty):
-                # Откат к предыдущему варианту без изменения рецепта
-                return cocktail_data
+            qty = float(recipe.get(ing_id_str, 0.0))
+            if float(ing.quantity) < qty:
+                if float(ing.quantity) <= 0.0:
+                    recipe.pop(ing_id_str, None)
+                else:
+                    recipe[ing_id_str] = float(ing.quantity)
 
         details = await self.build_recipe_details(recipe)
         totals = self.calculate_totals(details)
