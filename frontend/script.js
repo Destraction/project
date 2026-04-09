@@ -1,5 +1,7 @@
 const sessionId = "session_" + Math.random().toString(36).slice(2, 10);
-const ws = new WebSocket(`ws://localhost:8000/ws/${sessionId}`);
+const wsProtocol = window.location.protocol === "https:" ? "wss" : "ws";
+const backendHost = window.location.hostname || "localhost";
+const ws = new WebSocket(`${wsProtocol}://${backendHost}:8000/ws/${sessionId}`);
 
 const messagesDiv = document.getElementById("messages");
 const messageInput = document.getElementById("messageInput");
@@ -48,4 +50,3 @@ sendBtn.onclick = sendUserMessage;
 messageInput.addEventListener("keypress", (e) => {
   if (e.key === "Enter") sendUserMessage();
 });
-

@@ -7,7 +7,6 @@ from typing import Any, Dict
 from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.cocktail_generator import CocktailGenerator
 from app.free_llm_client import FreeLLMBartender
 from app.crud import confirm_order, create_order, save_dialogue_message
 from app.database import get_db
@@ -173,7 +172,6 @@ async def websocket_endpoint(
 ):
     await manager.connect(session_id, websocket)
     parser = PreferenceParser()
-    generator = CocktailGenerator(db)
     llm = FreeLLMBartender()
     SESSION_STATE[session_id] = _new_state()
 
@@ -191,6 +189,29 @@ async def websocket_endpoint(
             )
         except Exception:
             return "Я на связи, но модель отвечает медленно. Напиши ещё раз через пару секунд."
+
+    async def build_draft_with_llm(state_obj: Dict[str, Any]) -> Dict[str, Any] | None:
+        try:
+            raw = await asyncio.wait_for(
+                llm.propose_cocktail_from_db(db=db, state=state_obj),
+                timeout=30.0,
+            )
+        except Exception:
+            raw = None
+        if not raw:
+            return None
+        recipe = raw.get("recipe", {})
+        if not isinstance(recipe, dict) or not recipe:
+            return None
+        details = await llm.build_recipe_details(db, recipe)
+        if len(details) < 2:
+            return None
+        totals = llm.calculate_totals(details)
+        taste_profile = llm.calculate_taste_profile(state_obj.get("prefs", {}), details)
+        raw["details"] = details
+        raw["totals"] = totals
+        raw["taste_profile"] = taste_profile
+        return raw
 
     # Приветствие
     await manager.send_message(
@@ -299,8 +320,29 @@ async def websocket_endpoint(
                 if _is_adjustment_message(user_msg):
                     parsed_adj = parser.parse(user_msg)
                     _merge_prefs(state["prefs"], parsed_adj)
-                    state["draft"] = await generator.adjust_recipe(state["draft"], user_msg, state["prefs"])
-                    card = generator.format_recipe_card(state["draft"])
+                    updated = await llm.propose_cocktail_from_db(
+                        db=db,
+                        state=state,
+                        user_request=user_msg,
+                        current_draft=state["draft"],
+                    )
+                    if not updated:
+                        await manager.send_message(
+                            session_id,
+                            json.dumps(
+                                {
+                                    "type": "error",
+                                    "content": await ask_llm("Не удалось применить правку. Предложи новую корректировку по вкусу.", state),
+                                }
+                            ),
+                        )
+                        continue
+                    details = await llm.build_recipe_details(db, updated["recipe"])
+                    updated["details"] = details
+                    updated["totals"] = llm.calculate_totals(details)
+                    updated["taste_profile"] = llm.calculate_taste_profile(state["prefs"], details)
+                    state["draft"] = updated
+                    card = llm.format_recipe_card(state["draft"])
                     await manager.send_message(session_id, json.dumps({"type": "recommendation", "message": card}))
                     await save_dialogue_message(db, session_id, "assistant", card)
                     SESSION_STATE[session_id] = state
@@ -335,7 +377,7 @@ async def websocket_endpoint(
                 SESSION_STATE[session_id] = state
                 continue
 
-            cocktail_data = await generator.generate(state["prefs"])
+            cocktail_data = await build_draft_with_llm(state)
             if cocktail_data is None:
                 await manager.send_message(
                     session_id,
@@ -351,7 +393,7 @@ async def websocket_endpoint(
                 )
                 continue
 
-            card = generator.format_recipe_card(cocktail_data)
+            card = llm.format_recipe_card(cocktail_data)
             state["draft"] = cocktail_data
             state["phase"] = "draft_ready"
             await manager.send_message(
@@ -382,4 +424,3 @@ async def websocket_endpoint(
     finally:
         SESSION_STATE.pop(session_id, None)
         manager.disconnect(session_id)
-

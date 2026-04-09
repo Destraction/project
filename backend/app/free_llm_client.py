@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import httpx
 from sqlalchemy import select
@@ -72,6 +72,378 @@ class FreeLLMBartender:
             if str(item).lower() not in allowed_set:
                 return False
         return True
+
+    def _extract_json_object(self, text: str) -> Optional[Dict[str, Any]]:
+        raw = (text or "").strip()
+        if not raw:
+            return None
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else None
+        except Exception:
+            pass
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start < 0 or end <= start:
+            return None
+        candidate = raw[start : end + 1]
+        try:
+            parsed = json.loads(candidate)
+            return parsed if isinstance(parsed, dict) else None
+        except Exception:
+            return None
+
+    async def propose_cocktail_from_db(
+        self,
+        db: AsyncSession,
+        state: Dict[str, Any],
+        user_request: str = "",
+        current_draft: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        if not self.enabled_chad:
+            return None
+
+        res = await db.execute(select(Ingredient))
+        all_ingredients = list(res.scalars().all())
+        context = await self.build_bar_context(db)
+
+        available_ingredients = [
+            {
+                "id": int(ing.id),
+                "name": str(ing.name),
+                "category": str(ing.category),
+                "unit": str(ing.unit or "ml"),
+                "quantity": float(ing.quantity or 0.0),
+            }
+            for ing in all_ingredients
+            if float(ing.quantity or 0.0) > 0.0
+        ]
+        if not available_ingredients:
+            return None
+
+        prefs = state.get("prefs", {})
+        profile = state.get("profile", {})
+
+        system_prompt = (
+            "Ты бармен-нутрициолог в безалкогольном баре и отвечаешь за итоговый рецепт. "
+            "Твоя задача: собрать или скорректировать готовый рецепт коктейля только из ингредиентов, которые есть в переданном списке. "
+            "Строго соблюдай остатки и не превышай quantity каждого ингредиента. "
+            "Не используй ингредиенты, которых нет в available_ingredients. "
+            "Учитывай пожелания клиента (prefs/profile), сочетаемость и баланс вкуса, а также последнее сообщение клиента. "
+            "Верни только JSON без пояснений в формате: "
+            "{\"name\":\"...\",\"description\":\"...\",\"ingredients\":[{\"name\":\"...\",\"qty\":50}],\"serving_ml\":300}. "
+            "qty должен быть числом > 0. "
+            "ingredients должен содержать 2..7 позиций. "
+            "Если ice=false в prefs, не добавляй лед."
+        )
+
+        user_payload = {
+            "task": "compose_cocktail_recipe",
+            "prefs": prefs,
+            "profile": profile,
+            "user_request": user_request,
+            "current_draft": current_draft,
+            "bar_context": context,
+            "available_ingredients": available_ingredients,
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=45.0) as client:
+                req_json: Dict[str, Any] = {
+                    "message": json.dumps(user_payload, ensure_ascii=False),
+                    "api_key": self.chad_api_key,
+                    "history": [{"role": "system", "content": system_prompt}],
+                }
+                resp = await client.post(url=self.chad_endpoint, json=req_json)
+                resp.raise_for_status()
+                data = resp.json()
+                if not data.get("is_success", False):
+                    return None
+
+                payload = self._extract_json_object(str(data.get("response", "")))
+                if not payload:
+                    return None
+
+                name = str(payload.get("name", "")).strip()
+                description = str(payload.get("description", "")).strip()
+                ingredients = payload.get("ingredients", [])
+                if not name or not isinstance(ingredients, list):
+                    return None
+                if len(ingredients) < 2 or len(ingredients) > 7:
+                    return None
+
+                by_name = {str(ing.name).lower(): ing for ing in all_ingredients}
+                recipe: Dict[str, float] = {}
+                ice_allowed = bool(prefs.get("ice", True))
+                for item in ingredients:
+                    if not isinstance(item, dict):
+                        return None
+                    ing_name = str(item.get("name", "")).strip().lower()
+                    qty_raw = item.get("qty", 0)
+                    try:
+                        qty = float(qty_raw)
+                    except Exception:
+                        return None
+                    if qty <= 0:
+                        return None
+                    ing = by_name.get(ing_name)
+                    if not ing:
+                        return None
+                    if str(ing.category or "") == "ice" and not ice_allowed:
+                        continue
+                    stock_qty = float(ing.quantity or 0.0)
+                    if stock_qty <= 0.0:
+                        return None
+                    final_qty = min(stock_qty, qty)
+                    if final_qty <= 0.0:
+                        return None
+                    key = str(int(ing.id))
+                    recipe[key] = round(float(recipe.get(key, 0.0)) + float(final_qty), 1)
+
+                if len(recipe) < 2:
+                    return None
+
+                ingredients_details = [{"id": int(k), "qty": float(v)} for k, v in recipe.items()]
+                first_id = int(ingredients_details[0]["id"])
+                first_name = next((str(ing.name) for ing in all_ingredients if int(ing.id) == first_id), "классической основы")
+                return {
+                    "name": name,
+                    "description": description or f"Авторский напиток на основе {first_name}",
+                    "recipe": recipe,
+                    "ingredients_details": ingredients_details,
+                }
+        except Exception:
+            return None
+
+    async def build_recipe_details(self, db: AsyncSession, recipe: Dict[str, float]) -> List[Dict[str, Any]]:
+        if not recipe:
+            return []
+        ids = [int(x) for x in recipe.keys()]
+        res = await db.execute(select(Ingredient).where(Ingredient.id.in_(ids)))
+        ing_map = {int(ing.id): ing for ing in res.scalars().all()}
+        details: List[Dict[str, Any]] = []
+        for ing_id_str, qty in recipe.items():
+            ing = ing_map.get(int(ing_id_str))
+            if not ing:
+                continue
+            details.append(
+                {
+                    "id": int(ing.id),
+                    "name": str(ing.name),
+                    "category": str(ing.category),
+                    "unit": str(ing.unit or "ml"),
+                    "qty": float(qty),
+                }
+            )
+        return details
+
+    def calculate_totals(self, details: List[Dict[str, Any]]) -> Dict[str, float]:
+        nutrition_reference = {
+            "base": {"kcal": 0.0, "protein": 0.0, "fat": 0.0, "carbs": 0.0},
+            "ice": {"kcal": 0.0, "protein": 0.0, "fat": 0.0, "carbs": 0.0},
+            "juice": {"kcal": 44.0, "protein": 0.4, "fat": 0.1, "carbs": 10.0},
+            "syrup": {"kcal": 260.0, "protein": 0.0, "fat": 0.0, "carbs": 65.0},
+            "additive": {"kcal": 130.0, "protein": 2.0, "fat": 2.0, "carbs": 18.0},
+            "fruit": {"kcal": 45.0, "protein": 0.6, "fat": 0.2, "carbs": 10.0},
+        }
+
+        volume_without_ice_ml = 0.0
+        ice_volume_ml = 0.0
+        kcal = protein = fat = carbs = 0.0
+
+        for item in details:
+            qty = float(item.get("qty", 0.0))
+            unit = str(item.get("unit") or "")
+            category = str(item.get("category") or "")
+            base = nutrition_reference.get(category, nutrition_reference["additive"])
+            factor = qty if unit == "piece" else qty / 100.0
+            factor = max(0.0, factor)
+            kcal += base["kcal"] * factor
+            protein += base["protein"] * factor
+            fat += base["fat"] * factor
+            carbs += base["carbs"] * factor
+
+            if unit == "ml":
+                if category == "ice":
+                    ice_volume_ml += qty
+                else:
+                    volume_without_ice_ml += qty
+            elif unit == "g":
+                if category == "ice":
+                    ice_volume_ml += qty
+                else:
+                    volume_without_ice_ml += qty * 0.7
+            elif unit == "piece":
+                volume_without_ice_ml += qty * 25.0
+
+        return {
+            "volume_without_ice_ml": round(volume_without_ice_ml, 1),
+            "volume_with_ice_ml": round(volume_without_ice_ml + ice_volume_ml, 1),
+            "kcal": round(kcal, 1),
+            "protein": round(protein, 1),
+            "fat": round(fat, 1),
+            "carbs": round(carbs, 1),
+        }
+
+    def calculate_taste_profile(self, prefs: Dict[str, Any], details: List[Dict[str, Any]]) -> Dict[str, int]:
+        def to_ml(item: Dict[str, Any]) -> float:
+            qty = float(item.get("qty", 0.0) or 0.0)
+            unit = str(item.get("unit") or "")
+            if unit == "ml":
+                return qty
+            if unit == "g":
+                return qty * 0.7
+            if unit == "piece":
+                return qty * 25.0
+            return qty
+
+        citrus_keywords = ["лимон", "лайм", "апельсин", "мандар", "грейпфрут", "цедра", "юдзу", "каламанси", "помело"]
+        tart_keywords = ["клюкв", "гранат", "смородин", "облепих", "барбарис", "ревен", "уксус", "томат"]
+        sweet_keywords = ["арбуз", "дын", "банан", "манго", "персик", "груш", "виноград", "яблок", "ананас", "маракуй"]
+        mint_keywords = ["мят"]
+        spice_keywords = ["имбир", "перец", "кориц", "кардамон", "гвозд", "чили", "куркум", "бадьян", "мускат"]
+
+        flavor_volume_ml = 0.0
+        total_volume_ml = 0.0
+        sweet_points = 0.0
+        sour_points = 0.0
+        fresh_points = 0.0
+        spice_points = 0.0
+        body_points = 0.0
+
+        for item in details:
+            name = str(item.get("name", "")).lower()
+            cat = str(item.get("category", "")).lower()
+            ml = to_ml(item)
+            total_volume_ml += ml
+
+            if cat == "ice":
+                continue
+            if cat != "base":
+                flavor_volume_ml += ml
+
+            sweet_coef = 0.05
+            sour_coef = 0.02
+            fresh_coef = 0.03
+            spice_coef = 0.0
+            body_coef = 0.04
+
+            if cat == "syrup":
+                sweet_coef, sour_coef, fresh_coef, body_coef = 1.0, 0.02, 0.02, 0.55
+            elif cat == "juice":
+                sweet_coef, sour_coef, fresh_coef, body_coef = 0.22, 0.18, 0.07, 0.10
+            elif cat == "fruit":
+                sweet_coef, sour_coef, fresh_coef, body_coef = 0.18, 0.12, 0.08, 0.28
+            elif cat == "additive":
+                sweet_coef, sour_coef, fresh_coef, body_coef = 0.08, 0.05, 0.10, 0.18
+            elif cat == "base":
+                sweet_coef, sour_coef, fresh_coef, body_coef = 0.0, 0.0, 0.02, 0.0
+
+            if any(k in name for k in citrus_keywords):
+                sour_coef += 0.75
+                fresh_coef += 0.35
+                sweet_coef = max(0.0, sweet_coef - 0.08)
+            if any(k in name for k in tart_keywords):
+                sour_coef += 0.45
+                sweet_coef = max(0.0, sweet_coef - 0.05)
+            if any(k in name for k in sweet_keywords):
+                sweet_coef += 0.25
+                sour_coef = max(0.0, sour_coef - 0.08)
+            if any(k in name for k in mint_keywords):
+                fresh_coef += 0.90
+            if any(k in name for k in spice_keywords):
+                spice_coef += 1.05
+                body_coef += 0.08
+            if "газирован" in name or "сода" in name or "тоник" in name:
+                fresh_coef += 0.25
+
+            sweet_points += ml * sweet_coef
+            sour_points += ml * sour_coef
+            fresh_points += ml * fresh_coef
+            spice_points += ml * spice_coef
+            body_points += ml * body_coef
+
+        base_den = max(1.0, flavor_volume_ml)
+        total_den = max(1.0, total_volume_ml)
+        sweet_proxy = min(1.0, sweet_points / (base_den * 0.85))
+        sour_proxy = min(1.0, sour_points / (base_den * 0.95))
+        fresh_proxy = min(1.0, fresh_points / (total_den * 0.45))
+        spice_proxy = min(1.0, spice_points / (base_den * 0.60))
+        body_proxy = min(1.0, body_points / (total_den * 0.35))
+
+        if flavor_volume_ml <= 0.01:
+            sweet_proxy = max(sweet_proxy, max(0.0, min(1.0, float(prefs.get("sweetness", 0.5)))))
+            sour_proxy = max(sour_proxy, max(0.0, min(1.0, float(prefs.get("sourness", 0.3)))))
+            fresh_proxy = max(fresh_proxy, 0.2)
+
+        return {
+            "sweetness": min(10, max(1, int(round(sweet_proxy * 10)))),
+            "sourness": min(10, max(1, int(round(sour_proxy * 10)))),
+            "freshness": min(10, max(1, int(round(fresh_proxy * 10)))),
+            "spice": min(10, max(1, int(round(spice_proxy * 10)))),
+            "body": min(10, max(1, int(round(body_proxy * 10)))),
+        }
+
+    def _profile_summary(self, taste: Dict[str, Any]) -> str:
+        sweetness = int(taste.get("sweetness", 1) or 1)
+        sourness = int(taste.get("sourness", 1) or 1)
+        freshness = int(taste.get("freshness", 1) or 1)
+        spice = int(taste.get("spice", 1) or 1)
+        body = int(taste.get("body", 1) or 1)
+        sweet_word = "сухой" if sweetness <= 3 else "умеренно сладкий" if sweetness <= 6 else "сладкий"
+        sour_word = "мягкий по кислотности" if sourness <= 3 else "сбалансированно кислый" if sourness <= 6 else "ярко кислый"
+        fresh_word = "спокойный" if freshness <= 3 else "освежающий" if freshness <= 6 else "очень освежающий"
+        spice_word = "без выраженной пряности" if spice <= 3 else "слегка пряный" if spice <= 6 else "пряный"
+        body_word = "лёгкий" if body <= 3 else "средней плотности" if body <= 6 else "плотный"
+        return f"Профиль: {sweet_word}, {sour_word}, {fresh_word}, {spice_word}, {body_word}."
+
+    def format_recipe_card(self, cocktail_data: Dict[str, Any]) -> str:
+        name = cocktail_data.get("name", "Авторский напиток")
+        description = cocktail_data.get("description", "")
+        details = cocktail_data.get("details", [])
+        totals = cocktail_data.get("totals", {})
+        taste = cocktail_data.get("taste_profile", {})
+        lines = [
+            f"🍹 {name}",
+            description,
+            self._profile_summary(taste),
+            "",
+            "Профиль напитка (1-10):",
+            f"- сладость: {taste.get('sweetness', 0)}",
+            f"- кислотность: {taste.get('sourness', 0)}",
+            f"- свежесть: {taste.get('freshness', 0)}",
+            f"- пряность: {taste.get('spice', 0)}",
+            f"- плотность вкуса: {taste.get('body', 0)}",
+            "",
+            "Объём 1 порции:",
+            f"- без льда: {totals.get('volume_without_ice_ml', 0)} мл",
+            f"- со льдом: {totals.get('volume_with_ice_ml', 0)} мл",
+            "",
+            "КБЖУ (на порцию):",
+            f"- К: {totals.get('kcal', 0)} ккал",
+            f"- Б: {totals.get('protein', 0)} г",
+            f"- Ж: {totals.get('fat', 0)} г",
+            f"- У: {totals.get('carbs', 0)} г",
+            "",
+            "Состав:",
+        ]
+        for item in details:
+            lines.append(f"- {item['name']}: {item['qty']} {item['unit']}")
+        lines.extend(
+            [
+                "",
+                "Если хотите, я изменю состав: напишите, например:",
+                "- 'добавь мяту'",
+                "- 'убери сироп'",
+                "- 'сделай слаще' / 'сделай менее сладким'",
+                "- 'сделай кислее' / 'сделай менее кислым'",
+                "- 'сделай прянее' / 'сделай менее пряным'",
+                "- 'без льда'",
+                "- 'объем 350 мл'",
+                "Либо напишите 'подтвердить', чтобы оформить заказ.",
+            ]
+        )
+        return "\n".join(lines)
 
     async def reply(
         self,
@@ -152,4 +524,3 @@ class FreeLLMBartender:
                 return content
         except Exception:
             return fallback_text or technical_fallback
-
