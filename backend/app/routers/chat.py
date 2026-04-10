@@ -160,8 +160,54 @@ def _is_confirm_message(text: str) -> bool:
 
 def _is_adjustment_message(text: str) -> bool:
     t = text.lower().strip()
-    markers = ["добавь", "убери", "удали", "слаще", "менее слад", "меньше слад", "объем", "объём", "без льда", "добавь лёд", "добавь лед", "/10"]
+    markers = [
+        "добав",
+        "убер",
+        "удал",
+        "замен",
+        "измени",
+        "скоррект",
+        "слаще",
+        "менее слад",
+        "меньше слад",
+        "кислее",
+        "менее кисл",
+        "меньше кисл",
+        "прян",
+        "мят",
+        "цитрус",
+        "фрукт",
+        "больше",
+        "меньше",
+        "усиль",
+        "ослаб",
+        "объем",
+        "объём",
+        "мл",
+        "без льда",
+        "со льдом",
+        "с льдом",
+        "/10",
+    ]
     return any(m in t for m in markers)
+
+
+def _should_adjust_draft(text: str, state: Dict[str, Any], parsed: Dict[str, Any]) -> bool:
+    if _is_adjustment_message(text):
+        return True
+    explicit_fields = parsed.get("_explicit_fields", [])
+    if explicit_fields:
+        return True
+    if parsed.get("desired_terms") or parsed.get("avoid_terms"):
+        return True
+    draft = state.get("draft") or {}
+    draft_details = draft.get("details") or []
+    t = text.lower().strip()
+    for item in draft_details:
+        ingredient_name = str(item.get("name", "")).lower()
+        if ingredient_name and ingredient_name in t:
+            return True
+    return False
 
 
 @router.websocket("/ws/{session_id}")
@@ -317,9 +363,10 @@ async def websocket_endpoint(
                     SESSION_STATE[session_id] = state
                     continue
 
-                if _is_adjustment_message(user_msg):
-                    parsed_adj = parser.parse(user_msg)
+                parsed_adj = parser.parse(user_msg)
+                if _should_adjust_draft(user_msg, state, parsed_adj):
                     _merge_prefs(state["prefs"], parsed_adj)
+                    _parse_meta_preferences(user_msg, state)
                     updated = await llm.propose_cocktail_from_db(
                         db=db,
                         state=state,

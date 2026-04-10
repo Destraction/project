@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import httpx
@@ -93,6 +94,65 @@ class FreeLLMBartender:
         except Exception:
             return None
 
+    def _sanitize_assistant_text(self, text: str) -> str:
+        sanitized = re.sub(r"\*\*[^*\n]+?\*\*", "", text or "")
+        sanitized = sanitized.replace("****", "")
+        sanitized = re.sub(r"[ \t]{2,}", " ", sanitized)
+        sanitized = re.sub(r"\n{3,}", "\n\n", sanitized)
+        return sanitized.strip()
+
+    def _draft_for_prompt(
+        self,
+        current_draft: Optional[Dict[str, Any]],
+        all_ingredients: List[Ingredient],
+    ) -> Optional[Dict[str, Any]]:
+        if not isinstance(current_draft, dict):
+            return None
+        recipe = current_draft.get("recipe", {})
+        if not isinstance(recipe, dict):
+            return None
+        by_id = {int(ing.id): ing for ing in all_ingredients}
+        ingredients_for_prompt: List[Dict[str, Any]] = []
+        for ing_id_str, qty in recipe.items():
+            try:
+                ing_id = int(ing_id_str)
+                qty_val = float(qty)
+            except Exception:
+                continue
+            ing = by_id.get(ing_id)
+            if not ing:
+                continue
+            ingredients_for_prompt.append(
+                {
+                    "id": ing_id,
+                    "name": str(ing.name),
+                    "category": str(ing.category),
+                    "unit": str(ing.unit or "ml"),
+                    "qty": qty_val,
+                }
+            )
+        return {
+            "name": str(current_draft.get("name", "")),
+            "description": str(current_draft.get("description", "")),
+            "ingredients": ingredients_for_prompt,
+            "taste_profile": current_draft.get("taste_profile", {}),
+            "totals": current_draft.get("totals", {}),
+        }
+
+    def _extract_forbidden_terms(self, user_request: str, prefs: Dict[str, Any]) -> List[str]:
+        forbidden = list(prefs.get("avoid_terms", []) or [])
+        text = (user_request or "").lower()
+        for m in re.findall(r"(?:без|убери|убрать|удали|исключи)\s+([а-яa-zё0-9\-\s]{2,40})", text):
+            part = m.strip().split(",")[0].split(".")[0].strip()
+            if part:
+                forbidden.append(part)
+        out: List[str] = []
+        for token in forbidden:
+            cleaned = str(token).lower().strip()
+            if cleaned:
+                out.append(cleaned)
+        return list(dict.fromkeys(out))
+
     async def propose_cocktail_from_db(
         self,
         db: AsyncSession,
@@ -124,6 +184,7 @@ class FreeLLMBartender:
         prefs = state.get("prefs", {})
         profile = state.get("profile", {})
 
+        is_adjustment = bool(current_draft) and bool((user_request or "").strip())
         system_prompt = (
             "Ты бармен-нутрициолог в безалкогольном баре и отвечаешь за итоговый рецепт. "
             "Твоя задача: собрать или скорректировать готовый рецепт коктейля только из ингредиентов, которые есть в переданном списке. "
@@ -136,13 +197,20 @@ class FreeLLMBartender:
             "ingredients должен содержать 2..7 позиций. "
             "Если ice=false в prefs, не добавляй лед."
         )
+        if is_adjustment:
+            system_prompt += (
+                "Режим корректировки: у тебя уже есть текущий draft. "
+                "Сначала примени конкретные правки из user_request, затем подстрой рецепт под prefs/profile. "
+                "Приоритет изменений: 1) явные инструкции из user_request, 2) prefs/profile, 3) баланс вкуса. "
+                "Сохраняй ядро текущего draft и меняй только то, что нужно для запроса."
+            )
 
         user_payload = {
             "task": "compose_cocktail_recipe",
             "prefs": prefs,
             "profile": profile,
             "user_request": user_request,
-            "current_draft": current_draft,
+            "current_draft": self._draft_for_prompt(current_draft, all_ingredients),
             "bar_context": context,
             "available_ingredients": available_ingredients,
         }
@@ -165,7 +233,7 @@ class FreeLLMBartender:
                     return None
 
                 name = str(payload.get("name", "")).strip()
-                description = str(payload.get("description", "")).strip()
+                description = self._sanitize_assistant_text(str(payload.get("description", "")).strip())
                 ingredients = payload.get("ingredients", [])
                 if not name or not isinstance(ingredients, list):
                     return None
@@ -175,6 +243,7 @@ class FreeLLMBartender:
                 by_name = {str(ing.name).lower(): ing for ing in all_ingredients}
                 recipe: Dict[str, float] = {}
                 ice_allowed = bool(prefs.get("ice", True))
+                forbidden_terms = self._extract_forbidden_terms(user_request, prefs)
                 for item in ingredients:
                     if not isinstance(item, dict):
                         return None
@@ -189,6 +258,8 @@ class FreeLLMBartender:
                     ing = by_name.get(ing_name)
                     if not ing:
                         return None
+                    if forbidden_terms and any(term in ing_name for term in forbidden_terms):
+                        continue
                     if str(ing.category or "") == "ice" and not ice_allowed:
                         continue
                     stock_qty = float(ing.quantity or 0.0)
@@ -207,7 +278,7 @@ class FreeLLMBartender:
                 first_id = int(ingredients_details[0]["id"])
                 first_name = next((str(ing.name) for ing in all_ingredients if int(ing.id) == first_id), "классической основы")
                 return {
-                    "name": name,
+                    "name": self._sanitize_assistant_text(name),
                     "description": description or f"Авторский напиток на основе {first_name}",
                     "recipe": recipe,
                     "ingredients_details": ingredients_details,
@@ -466,7 +537,8 @@ class FreeLLMBartender:
         system_prompt = (
             "Роль: Бармен в безалкогольном баре. Общение дружелюбное, ненавязчивое, в формате бармен–гость. Сразу входи в роль."
             "Язык и стиль: Русский язык, соблюдение синтаксических норм. Без обращений к клиенту в репликах. Без фраз вроде «конечно», «без проблем» и т.д."
-            "Процесс подбора коктейля: Задавай строго по одному вопросу за раз — максимум 10 вопросов. После этого предложи готовый вариант. Не предлагай рецепт заранее и не «собирай коктейль за гостя». Учитывай контекст ответов — не повторяй вопросы о том, что уже выяснено (например, если гость сказал «кислый гранатовый» — не спрашивай про кислотность, только предложи её отрегулировать при необходимости)."
+            "Формат текста: не используй markdown, не пиши фразы, выделенные через **...**."
+            "Процесс подбора коктейля: Задавай строго по одному вопросу за раз — максимум 12 вопросов. До предложения рецепта задай минимум 6 действительно разных уточняющих вопросов по вкусу и ограничениям. Не предлагай рецепт заранее и не «собирай коктейль за гостя». Учитывай контекст ответов — не повторяй вопросы о том, что уже выяснено."
             "Баланс вкуса: Профессионально управляй балансом. «Слаще / менее сладко» — регулируй сладкие ингредиенты (сиропы). «Кислее / менее кисло» — регулируй кислые (соки, кислые компоненты). Перед добавлением ингредиента уточняй его вкусовые характеристики и учитывай их."
             "Правки после подбора: Отвечай кратко, по делу. Максимум 1–2 уточняющих вопроса. Подтверждай изменение и предлагай проверить перед финальным заказом."
             "Ограничения: Предлагай только доступные ингредиенты из остатков. Учитывай сочетаемость согласно барным стандартам."
@@ -519,8 +591,8 @@ class FreeLLMBartender:
                         return fallback_text or technical_fallback
                     if not self._validate_json_payload(parsed, allowed_set):
                         return fallback_text or technical_fallback
-                    return str(parsed.get("reply") or fallback_text)
+                    return self._sanitize_assistant_text(str(parsed.get("reply") or fallback_text))
 
-                return content
+                return self._sanitize_assistant_text(content)
         except Exception:
             return fallback_text or technical_fallback
