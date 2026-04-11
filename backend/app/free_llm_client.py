@@ -153,6 +153,109 @@ class FreeLLMBartender:
                 out.append(cleaned)
         return list(dict.fromkeys(out))
 
+    def _apply_confirmed_terms_constraint(
+        self,
+        recipe: Dict[str, float],
+        all_ingredients: List[Ingredient],
+        confirmed_terms: List[str],
+    ) -> Dict[str, float]:
+        terms = [str(x).lower().strip() for x in confirmed_terms if len(str(x).strip()) >= 3]
+        terms = list(dict.fromkeys([t for t in terms if t]))
+        if not terms or not recipe:
+            return recipe
+        by_id = {int(ing.id): ing for ing in all_ingredients}
+        matched_keys: List[str] = []
+        for key in recipe.keys():
+            ing = by_id.get(int(key))
+            if not ing:
+                continue
+            name = str(ing.name).lower()
+            if any(term in name for term in terms):
+                matched_keys.append(key)
+        if not matched_keys:
+            return {}
+        filtered: Dict[str, float] = {}
+        non_base_count = 0
+        for key, qty in recipe.items():
+            ing = by_id.get(int(key))
+            if not ing:
+                continue
+            cat = str(ing.category or "").lower()
+            if key in matched_keys or cat in {"base", "ice"}:
+                filtered[key] = qty
+                if cat not in {"base", "ice"}:
+                    non_base_count += 1
+        if len(filtered) >= 2 and non_base_count >= 1:
+            return filtered
+        return {}
+
+    def _apply_taste_adjustment_by_request(
+        self,
+        recipe: Dict[str, float],
+        user_request: str,
+        all_ingredients: List[Ingredient],
+    ) -> Dict[str, float]:
+        if not recipe:
+            return recipe
+        t = (user_request or "").lower()
+        by_id = {int(ing.id): ing for ing in all_ingredients}
+        acidic_markers = ["лимон", "лайм", "юдзу", "каламанси", "грейпфрут", "маракуй", "барбарис", "тамаринд", "уксус"]
+        sour_up = any(x in t for x in ["кислее", "больше кислот", "усиль кислот", "добавь кислот"])
+        sour_down = any(x in t for x in ["менее кисл", "меньше кислот", "смягчи кислот", "не таким кисл"])
+        sweet_up = any(x in t for x in ["слаще", "добавь слад", "усиль слад"])
+        sweet_down = any(x in t for x in ["менее слад", "меньше слад", "убери слад", "снизь слад"])
+
+        if sour_up and not sour_down:
+            boosted = False
+            for key in list(recipe.keys()):
+                ing = by_id.get(int(key))
+                if not ing:
+                    continue
+                name = str(ing.name).lower()
+                if any(m in name for m in acidic_markers):
+                    stock = float(ing.quantity or 0.0)
+                    recipe[key] = round(min(stock, float(recipe.get(key, 0.0)) + 18.0), 1)
+                    boosted = True
+            if not boosted:
+                candidates = [
+                    ing for ing in all_ingredients
+                    if str(ing.category).lower() == "juice"
+                    and float(ing.quantity or 0.0) > 0.0
+                    and any(m in str(ing.name).lower() for m in acidic_markers)
+                ]
+                if candidates:
+                    pick = sorted(candidates, key=lambda x: float(x.quantity or 0.0), reverse=True)[0]
+                    recipe[str(int(pick.id))] = round(min(float(pick.quantity or 0.0), 24.0), 1)
+            for key in list(recipe.keys()):
+                ing = by_id.get(int(key))
+                if ing and str(ing.category).lower() == "syrup":
+                    recipe[key] = max(0.0, round(float(recipe.get(key, 0.0)) * 0.65, 1))
+
+        if sour_down and not sour_up:
+            for key in list(recipe.keys()):
+                ing = by_id.get(int(key))
+                if not ing:
+                    continue
+                name = str(ing.name).lower()
+                if any(m in name for m in acidic_markers):
+                    recipe[key] = max(0.0, round(float(recipe.get(key, 0.0)) * 0.65, 1))
+
+        if sweet_up and not sweet_down:
+            for key in list(recipe.keys()):
+                ing = by_id.get(int(key))
+                if ing and str(ing.category).lower() == "syrup":
+                    stock = float(ing.quantity or 0.0)
+                    recipe[key] = round(min(stock, float(recipe.get(key, 0.0)) + 10.0), 1)
+        if sweet_down and not sweet_up:
+            for key in list(recipe.keys()):
+                ing = by_id.get(int(key))
+                if ing and str(ing.category).lower() == "syrup":
+                    recipe[key] = max(0.0, round(float(recipe.get(key, 0.0)) * 0.55, 1))
+
+        for key in [k for k, v in recipe.items() if float(v) <= 0.0]:
+            recipe.pop(key, None)
+        return recipe
+
     async def propose_cocktail_from_db(
         self,
         db: AsyncSession,
@@ -183,6 +286,10 @@ class FreeLLMBartender:
 
         prefs = state.get("prefs", {})
         profile = state.get("profile", {})
+        confirmed_terms = list(profile.get("confirmed_terms", []) or [])
+        requested_ingredients = list(profile.get("requested_ingredients", []) or [])
+        if not requested_ingredients:
+            return None
 
         is_adjustment = bool(current_draft) and bool((user_request or "").strip())
         system_prompt = (
@@ -197,6 +304,13 @@ class FreeLLMBartender:
             "ingredients должен содержать 2..7 позиций. "
             "Если ice=false в prefs, не добавляй лед."
         )
+        if confirmed_terms:
+            system_prompt += (
+                "В profile.confirmed_terms перечислены вкусы и ингредиенты, которые гость уже обсуждал и подтвердил. "
+                "Финальный состав должен опираться на эти термины. "
+                "Не добавляй новые яркие вкусовые ингредиенты, которые не соответствуют confirmed_terms. "
+                "Если ингредиент не совпадает с confirmed_terms, исключи его."
+            )
         if is_adjustment:
             system_prompt += (
                 "Режим корректировки: у тебя уже есть текущий draft. "
@@ -270,6 +384,9 @@ class FreeLLMBartender:
                         return None
                     key = str(int(ing.id))
                     recipe[key] = round(float(recipe.get(key, 0.0)) + float(final_qty), 1)
+
+                recipe = self._apply_taste_adjustment_by_request(recipe, user_request, all_ingredients)
+                recipe = self._apply_confirmed_terms_constraint(recipe, all_ingredients, confirmed_terms)
 
                 if len(recipe) < 2:
                     return None
@@ -535,15 +652,20 @@ class FreeLLMBartender:
         allowed_set = self._extract_allowed_set(context)
 
         system_prompt = (
-            "Роль: Бармен в безалкогольном баре. Общение дружелюбное, ненавязчивое, в формате бармен–гость. Сразу входи в роль."
-            "Язык и стиль: Русский язык, соблюдение синтаксических норм. Без обращений к клиенту в репликах. Без фраз вроде «конечно», «без проблем» и т.д."
-            "Формат текста: не используй markdown, не пиши фразы, выделенные через **...**."
-            "Процесс подбора коктейля: Задавай строго по одному вопросу за раз — максимум 12 вопросов. До предложения рецепта задай минимум 6 действительно разных уточняющих вопросов по вкусу и ограничениям. Не предлагай рецепт заранее и не «собирай коктейль за гостя». Учитывай контекст ответов — не повторяй вопросы о том, что уже выяснено."
-            "Баланс вкуса: Профессионально управляй балансом. «Слаще / менее сладко» — регулируй сладкие ингредиенты (сиропы). «Кислее / менее кисло» — регулируй кислые (соки, кислые компоненты). Перед добавлением ингредиента уточняй его вкусовые характеристики и учитывай их."
-            "Правки после подбора: Отвечай кратко, по делу. Максимум 1–2 уточняющих вопроса. Подтверждай изменение и предлагай проверить перед финальным заказом."
-            "Ограничения: Предлагай только доступные ингредиенты из остатков. Учитывай сочетаемость согласно барным стандартам."
-
-
+            "Роль: Бармен в безалкогольном баре. Формат общения приятельский бармен-гость."
+            "Пиши по-русски, без markdown и без выделений через **...**."
+            "Discovery-режим: в каждом сообщении максимум один вопрос."
+            "Каждый новый вопрос обязан развивать новую тему и не повторять уже закрытые темы из profile.notes и prefs."
+            "Стартовая логика вопросов: сначала направление базы вкуса (фруктовая, ягодная, пряная), затем подгруппа, затем основа (вода/газированная), затем кислотность/пряность, затем сладость, затем ограничения."
+            "После выбора направления вкуса обязательно уточни 1-3 конкретных ингредиента, которые гость хочет видеть в составе."
+            "Если гость просит пояснить термин, коротко объясни и перечисли 2-4 примера только из bar_context.examples_by_category."
+            "Примеры ингредиентов, которые ты называешь, должны присутствовать в доступных остатках."
+            "После каждого ответа гостя сначала коротко подтверди выбор, затем задай следующий один вопрос."
+            "Не предлагай финальный рецепт раньше, чем собраны ключевые параметры."
+            "Нельзя предлагать финальный коктейль, если гость не назвал хотя бы один конкретный ингредиент."
+            "Когда предлагаешь финальный вариант, используй только обсуждённые и подтверждённые вкусовые направления из profile.confirmed_terms, prefs и истории."
+            "Если данных не хватает, задай следующий уточняющий вопрос вместо рецепта."
+            "В режиме правок отвечай кратко и предлагай не более одного уточнения."
         )
         if strict_json:
             system_prompt += (
