@@ -31,8 +31,8 @@ ws.onmessage = (event) => {
   const data = JSON.parse(event.data);
   if (data.type === "system") addMessage(data.content, "system");
   else if (data.type === "recommendation") addMessage(data.message, "assistant");
-  else if (data.type === "success") addMessage(data.content, "system");
-  else if (data.type === "error") addMessage(data.content, "system");
+  else if (data.type === "success") addMessage(data.content, "success");
+  else if (data.type === "error") addMessage(data.content, "error");
   else if (data.content) addMessage(data.content, "assistant");
   else if (data.message) addMessage(data.message, "assistant");
 };

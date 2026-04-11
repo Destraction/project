@@ -4,22 +4,27 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Cocktail AI</title>
-    <link rel="stylesheet" href="/style.css" />
+    <link rel="stylesheet" href="/style.css?v=cyberpunk-lite-2" />
   </head>
   <body>
-    <div class="chat-container">
-      <div class="messages" id="messages"></div>
-      <div class="input-area">
-        <input
-          type="text"
-          id="messageInput"
-          placeholder="Опишите вкус и настроение. Когда уточним вкус — сможете редактировать состав: 'добавь мяту', 'убери сироп', 'сделай кислее', 'объем 350 мл'"
-        />
-        <button id="sendBtn">Отправить</button>
+    <div class="page-shell">
+      <div class="chat-container">
+        <div class="chat-header">
+          <div class="title">COCKTAIL AI // CYBER BAR</div>
+          <div class="subtitle">Нейро-бармен: сбор и настройка безалкогольного микса</div>
+        </div>
+        <div class="messages" id="messages"></div>
+        <div class="input-area">
+          <input
+            type="text"
+            id="messageInput"
+            placeholder="Опишите вкус и настроение. Можно править рецепт: 'добавь мяту', 'добавь кислотности', 'убери сироп', 'объем 350 мл'"
+          />
+          <button id="sendBtn">Отправить</button>
+        </div>
       </div>
     </div>
 
-    <script src="/script.js"></script>
+    <script src="/script.js?v=1"></script>
   </body>
 </html>
-
