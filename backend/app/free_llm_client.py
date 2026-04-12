@@ -18,25 +18,28 @@ class FreeLLMBartender:
     """
 
     SYSTEM_PROMPT = (
-        "Ты — бармен-нутрициолог в безалкогольном баре. Твой ответ зависит от переданных данных.\n"
-        "ОБЩИЕ ПРАВИЛА:\n"
-        "- Общайся по-русски, в приятельском стиле бармен-гость. Не используй markdown (без **...**).\n"
-        "- Используй ТОЛЬКО ингредиенты из available_ingredients или bar_context.available_stock. Строго соблюдай остатки (quantity).\n"
-        "- Учитывай пожелания (prefs, profile), историю и последнее сообщение. Если ice=false в prefs, не добавляй лед.\n\n"
-        "СИТУАЦИЯ 1: СОСТАВЛЕНИЕ РЕЦЕПТА (если в запросе есть task == 'compose_cocktail_recipe')\n"
-        "- Собери или скорректируй рецепт только из имеющихся ингредиентов.\n"
-        "- Если в profile.confirmed_terms есть данные, опирайся на них и не добавляй новые несовместимые вкусы.\n"
-        "- Если есть current_draft (режим корректировки), приоритет: 1) явные инструкции из user_request, 2) prefs/profile, 3) баланс вкуса. Сохраняй ядро draft.\n"
-        "- ОТВЕТ: СТРОГО JSON без пояснений: {\"name\":\"...\",\"description\":\"...\",\"ingredients\":[{\"name\":\"...\",\"qty\":50}],\"serving_ml\":300}.\n"
-        "- Ингредиентов: 2-7. qty > 0.\n\n"
-        "СИТУАЦИЯ 2: ДИАЛОГ И УТОЧНЕНИЕ (если task отсутствует)\n"
-        "- В Discovery-режиме (phase='discovery') задавай максимум ОДИН вопрос в сообщении. Новый вопрос должен развивать тему, не повторяя закрытые.\n"
-        "- Логика вопросов: база вкуса -> подгруппа -> основа -> кислотность/пряность -> сладость -> ограничения.\n"
-        "- Обязательно уточни 1-3 конкретных ингредиента, прежде чем предлагать рецепт. Не предлагай рецепт, пока не собраны ключевые параметры.\n"
-        "- После ответа гостя коротко подтверди выбор и задай один следующий вопрос.\n"
-        "- Если гость просит пояснить термин, коротко объясни и дай 2-4 примера только из bar_context.examples_by_category.\n"
-        "- В режиме правок отвечай кратко и предлагай не более одного уточнения.\n"
-        "- ОТВЕТ: Текст или СТРОГО JSON (если в запросе strict_json=true): {\"reply\": \"...\", \"mentioned_ingredients\": [\"...\"]}.\n"
+        "Ты — опытный бармен-нутрициолог в безалкогольном баре. Твоя цель — провести гостя от приветствия до заказа идеального коктейля.\n"
+        "ВСЁ ОБЩЕНИЕ И ЛОГИКА ОПРЕДЕЛЯЮТСЯ ТОБОЙ ЧЕРЕЗ JSON.\n\n"
+        "ОБЯЗАТЕЛЬНЫЙ ФОРМАТ ОТВЕТА (СТРОГО JSON):\n"
+        "{\n"
+        "  \"reply\": \"Твой текст для гостя (без markdown, приятельский тон)\",\n"
+        "  \"action\": \"chat | propose_recipe | confirm_order\",\n"
+        "  \"recipe\": {\n"
+        "    \"name\": \"Название\",\n"
+        "    \"description\": \"Красивое описание\",\n"
+        "    \"ingredients\": [{\"name\": \"ингредиент из списка\", \"qty\": 50}],\n"
+        "    \"serving_ml\": 300\n"
+        "  }\n"
+        "}\n\n"
+        "ПРАВИЛА:\n"
+        "1. Используй ТОЛЬКО ингредиенты из available_ingredients. Соблюдай остатки (quantity).\n"
+        "2. В режиме 'chat' (action='chat') — узнавай предпочтения. Задавай ОДИН вопрос за раз.\n"
+        "3. Когда предпочтения ясны (есть направление вкуса и 1-3 конкретных ингредиента), переходи к 'propose_recipe'.\n"
+        "4. В 'propose_recipe' — сформируй полный рецепт (2-7 ингредиентов) и красиво опиши его в 'reply'.\n"
+        "5. Если гость просит правки (добавить, убрать, изменить сладость) — снова используй 'propose_recipe' с обновленным составом.\n"
+        "6. Если гость подтверждает (пишет 'да', 'подтверждаю', 'оформить') — используй action='confirm_order'.\n"
+        "7. Если данных не хватает — продолжай 'chat'.\n"
+        "8. Учитывай prefs (лед, сладость и т.д.) и profile (историю).\n"
     )
 
     def __init__(self) -> None:
@@ -116,13 +119,6 @@ class FreeLLMBartender:
         except Exception:
             return None
 
-    def _sanitize_assistant_text(self, text: str) -> str:
-        sanitized = re.sub(r"\*\*[^*\n]+?\*\*", "", text or "")
-        sanitized = sanitized.replace("****", "")
-        sanitized = re.sub(r"[ \t]{2,}", " ", sanitized)
-        sanitized = re.sub(r"\n{3,}", "\n\n", sanitized)
-        return sanitized.strip()
-
     def _draft_for_prompt(
         self,
         current_draft: Optional[Dict[str, Any]],
@@ -161,123 +157,6 @@ class FreeLLMBartender:
             "totals": current_draft.get("totals", {}),
         }
 
-    def _extract_forbidden_terms(self, user_request: str, prefs: Dict[str, Any]) -> List[str]:
-        forbidden = list(prefs.get("avoid_terms", []) or [])
-        text = (user_request or "").lower()
-        for m in re.findall(r"(?:без|убери|убрать|удали|исключи)\s+([а-яa-zё0-9\-\s]{2,40})", text):
-            part = m.strip().split(",")[0].split(".")[0].strip()
-            if part:
-                forbidden.append(part)
-        out: List[str] = []
-        for token in forbidden:
-            cleaned = str(token).lower().strip()
-            if cleaned:
-                out.append(cleaned)
-        return list(dict.fromkeys(out))
-
-    def _apply_confirmed_terms_constraint(
-        self,
-        recipe: Dict[str, float],
-        all_ingredients: List[Ingredient],
-        confirmed_terms: List[str],
-    ) -> Dict[str, float]:
-        terms = [str(x).lower().strip() for x in confirmed_terms if len(str(x).strip()) >= 3]
-        terms = list(dict.fromkeys([t for t in terms if t]))
-        if not terms or not recipe:
-            return recipe
-        by_id = {int(ing.id): ing for ing in all_ingredients}
-        matched_keys: List[str] = []
-        for key in recipe.keys():
-            ing = by_id.get(int(key))
-            if not ing:
-                continue
-            name = str(ing.name).lower()
-            if any(term in name for term in terms):
-                matched_keys.append(key)
-        if not matched_keys:
-            return {}
-        filtered: Dict[str, float] = {}
-        non_base_count = 0
-        for key, qty in recipe.items():
-            ing = by_id.get(int(key))
-            if not ing:
-                continue
-            cat = str(ing.category or "").lower()
-            if key in matched_keys or cat in {"base", "ice"}:
-                filtered[key] = qty
-                if cat not in {"base", "ice"}:
-                    non_base_count += 1
-        if len(filtered) >= 2 and non_base_count >= 1:
-            return filtered
-        return {}
-
-    def _apply_taste_adjustment_by_request(
-        self,
-        recipe: Dict[str, float],
-        user_request: str,
-        all_ingredients: List[Ingredient],
-    ) -> Dict[str, float]:
-        if not recipe:
-            return recipe
-        t = (user_request or "").lower()
-        by_id = {int(ing.id): ing for ing in all_ingredients}
-        acidic_markers = ["лимон", "лайм", "юдзу", "каламанси", "грейпфрут", "маракуй", "барбарис", "тамаринд", "уксус"]
-        sour_up = any(x in t for x in ["кислее", "больше кислот", "усиль кислот", "добавь кислот"])
-        sour_down = any(x in t for x in ["менее кисл", "меньше кислот", "смягчи кислот", "не таким кисл"])
-        sweet_up = any(x in t for x in ["слаще", "добавь слад", "усиль слад"])
-        sweet_down = any(x in t for x in ["менее слад", "меньше слад", "убери слад", "снизь слад"])
-
-        if sour_up and not sour_down:
-            boosted = False
-            for key in list(recipe.keys()):
-                ing = by_id.get(int(key))
-                if not ing:
-                    continue
-                name = str(ing.name).lower()
-                if any(m in name for m in acidic_markers):
-                    stock = float(ing.quantity or 0.0)
-                    recipe[key] = round(min(stock, float(recipe.get(key, 0.0)) + 18.0), 1)
-                    boosted = True
-            if not boosted:
-                candidates = [
-                    ing for ing in all_ingredients
-                    if str(ing.category).lower() == "juice"
-                    and float(ing.quantity or 0.0) > 0.0
-                    and any(m in str(ing.name).lower() for m in acidic_markers)
-                ]
-                if candidates:
-                    pick = sorted(candidates, key=lambda x: float(x.quantity or 0.0), reverse=True)[0]
-                    recipe[str(int(pick.id))] = round(min(float(pick.quantity or 0.0), 24.0), 1)
-            for key in list(recipe.keys()):
-                ing = by_id.get(int(key))
-                if ing and str(ing.category).lower() == "syrup":
-                    recipe[key] = max(0.0, round(float(recipe.get(key, 0.0)) * 0.65, 1))
-
-        if sour_down and not sour_up:
-            for key in list(recipe.keys()):
-                ing = by_id.get(int(key))
-                if not ing:
-                    continue
-                name = str(ing.name).lower()
-                if any(m in name for m in acidic_markers):
-                    recipe[key] = max(0.0, round(float(recipe.get(key, 0.0)) * 0.65, 1))
-
-        if sweet_up and not sweet_down:
-            for key in list(recipe.keys()):
-                ing = by_id.get(int(key))
-                if ing and str(ing.category).lower() == "syrup":
-                    stock = float(ing.quantity or 0.0)
-                    recipe[key] = round(min(stock, float(recipe.get(key, 0.0)) + 10.0), 1)
-        if sweet_down and not sweet_up:
-            for key in list(recipe.keys()):
-                ing = by_id.get(int(key))
-                if ing and str(ing.category).lower() == "syrup":
-                    recipe[key] = max(0.0, round(float(recipe.get(key, 0.0)) * 0.55, 1))
-
-        for key in [k for k, v in recipe.items() if float(v) <= 0.0]:
-            recipe.pop(key, None)
-        return recipe
-
     async def propose_cocktail_from_db(
         self,
         db: AsyncSession,
@@ -308,11 +187,6 @@ class FreeLLMBartender:
 
         prefs = state.get("prefs", {})
         profile = state.get("profile", {})
-        confirmed_terms = list(profile.get("confirmed_terms", []) or [])
-        requested_ingredients = list(profile.get("requested_ingredients", []) or [])
-        if not requested_ingredients:
-            return None
-
         is_adjustment = bool(current_draft) and bool((user_request or "").strip())
 
         user_payload = {
@@ -344,56 +218,35 @@ class FreeLLMBartender:
                     return None
 
                 name = str(payload.get("name", "")).strip()
-                description = self._sanitize_assistant_text(str(payload.get("description", "")).strip())
+                description = str(payload.get("description", "")).strip()
                 ingredients = payload.get("ingredients", [])
                 if not name or not isinstance(ingredients, list):
-                    return None
-                if len(ingredients) < 2 or len(ingredients) > 7:
                     return None
 
                 by_name = {str(ing.name).lower(): ing for ing in all_ingredients}
                 recipe: Dict[str, float] = {}
-                ice_allowed = bool(prefs.get("ice", True))
-                forbidden_terms = self._extract_forbidden_terms(user_request, prefs)
                 for item in ingredients:
                     if not isinstance(item, dict):
-                        return None
+                        continue
                     ing_name = str(item.get("name", "")).strip().lower()
                     qty_raw = item.get("qty", 0)
                     try:
                         qty = float(qty_raw)
                     except Exception:
-                        return None
-                    if qty <= 0:
-                        return None
+                        continue
                     ing = by_name.get(ing_name)
                     if not ing:
-                        return None
-                    if forbidden_terms and any(term in ing_name for term in forbidden_terms):
                         continue
-                    if str(ing.category or "") == "ice" and not ice_allowed:
-                        continue
-                    stock_qty = float(ing.quantity or 0.0)
-                    if stock_qty <= 0.0:
-                        return None
-                    final_qty = min(stock_qty, qty)
-                    if final_qty <= 0.0:
-                        return None
                     key = str(int(ing.id))
-                    recipe[key] = round(float(recipe.get(key, 0.0)) + float(final_qty), 1)
-
-                recipe = self._apply_taste_adjustment_by_request(recipe, user_request, all_ingredients)
-                recipe = self._apply_confirmed_terms_constraint(recipe, all_ingredients, confirmed_terms)
+                    recipe[key] = round(float(recipe.get(key, 0.0)) + float(qty), 1)
 
                 if len(recipe) < 2:
                     return None
 
                 ingredients_details = [{"id": int(k), "qty": float(v)} for k, v in recipe.items()]
-                first_id = int(ingredients_details[0]["id"])
-                first_name = next((str(ing.name) for ing in all_ingredients if int(ing.id) == first_id), "классической основы")
                 return {
-                    "name": self._sanitize_assistant_text(name),
-                    "description": description or f"Авторский напиток на основе {first_name}",
+                    "name": name,
+                    "description": description,
                     "recipe": recipe,
                     "ingredients_details": ingredients_details,
                 }
@@ -569,67 +422,6 @@ class FreeLLMBartender:
             "body": min(10, max(1, int(round(body_proxy * 10)))),
         }
 
-    def _profile_summary(self, taste: Dict[str, Any]) -> str:
-        sweetness = int(taste.get("sweetness", 1) or 1)
-        sourness = int(taste.get("sourness", 1) or 1)
-        freshness = int(taste.get("freshness", 1) or 1)
-        spice = int(taste.get("spice", 1) or 1)
-        body = int(taste.get("body", 1) or 1)
-        sweet_word = "сухой" if sweetness <= 3 else "умеренно сладкий" if sweetness <= 6 else "сладкий"
-        sour_word = "мягкий по кислотности" if sourness <= 3 else "сбалансированно кислый" if sourness <= 6 else "ярко кислый"
-        fresh_word = "спокойный" if freshness <= 3 else "освежающий" if freshness <= 6 else "очень освежающий"
-        spice_word = "без выраженной пряности" if spice <= 3 else "слегка пряный" if spice <= 6 else "пряный"
-        body_word = "лёгкий" if body <= 3 else "средней плотности" if body <= 6 else "плотный"
-        return f"Профиль: {sweet_word}, {sour_word}, {fresh_word}, {spice_word}, {body_word}."
-
-    def format_recipe_card(self, cocktail_data: Dict[str, Any]) -> str:
-        name = cocktail_data.get("name", "Авторский напиток")
-        description = cocktail_data.get("description", "")
-        details = cocktail_data.get("details", [])
-        totals = cocktail_data.get("totals", {})
-        taste = cocktail_data.get("taste_profile", {})
-        lines = [
-            f"🍹 {name}",
-            description,
-            self._profile_summary(taste),
-            "",
-            "Профиль напитка (1-10):",
-            f"- сладость: {taste.get('sweetness', 0)}",
-            f"- кислотность: {taste.get('sourness', 0)}",
-            f"- свежесть: {taste.get('freshness', 0)}",
-            f"- пряность: {taste.get('spice', 0)}",
-            f"- плотность вкуса: {taste.get('body', 0)}",
-            "",
-            "Объём 1 порции:",
-            f"- без льда: {totals.get('volume_without_ice_ml', 0)} мл",
-            f"- со льдом: {totals.get('volume_with_ice_ml', 0)} мл",
-            "",
-            "КБЖУ (на порцию):",
-            f"- К: {totals.get('kcal', 0)} ккал",
-            f"- Б: {totals.get('protein', 0)} г",
-            f"- Ж: {totals.get('fat', 0)} г",
-            f"- У: {totals.get('carbs', 0)} г",
-            "",
-            "Состав:",
-        ]
-        for item in details:
-            lines.append(f"- {item['name']}: {item['qty']} {item['unit']}")
-        lines.extend(
-            [
-                "",
-                "Если хотите, я изменю состав: напишите, например:",
-                "- 'добавь мяту'",
-                "- 'убери сироп'",
-                "- 'сделай слаще' / 'сделай менее сладким'",
-                "- 'сделай кислее' / 'сделай менее кислым'",
-                "- 'сделай прянее' / 'сделай менее пряным'",
-                "- 'без льда'",
-                "- 'объем 350 мл'",
-                "Либо напишите 'подтвердить', чтобы оформить заказ.",
-            ]
-        )
-        return "\n".join(lines)
-
     async def reply(
         self,
         db: AsyncSession,
@@ -682,15 +474,17 @@ class FreeLLMBartender:
                 if not content:
                     return fallback_text or technical_fallback
 
+                # Мы больше не санируем текст жестко, даем ИИ свободу.
+                # Но если это strict_json, проверяем его.
                 if strict_json:
                     try:
                         parsed = json.loads(content)
+                        if not self._validate_json_payload(parsed, allowed_set):
+                            return fallback_text or technical_fallback
+                        return content # Возвращаем сырой JSON для дальнейшей обработки в chat.py
                     except Exception:
                         return fallback_text or technical_fallback
-                    if not self._validate_json_payload(parsed, allowed_set):
-                        return fallback_text or technical_fallback
-                    return self._sanitize_assistant_text(str(parsed.get("reply") or fallback_text))
 
-                return self._sanitize_assistant_text(content)
+                return content
         except Exception:
             return fallback_text or technical_fallback
