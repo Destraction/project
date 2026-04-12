@@ -22,7 +22,7 @@ class FreeLLMBartender:
         "ВСЁ ОБЩЕНИЕ И ЛОГИКА ОПРЕДЕЛЯЮТСЯ ТОБОЙ ЧЕРЕЗ JSON.\n\n"
         "ОБЯЗАТЕЛЬНЫЙ ФОРМАТ ОТВЕТА (СТРОГО JSON):\n"
         "{\n"
-        "  \"reply\": \"Твой текст для гостя (без markdown, приятельский тон)\",\n"
+        "  \"reply\": \"Твой текст для гостя (без markdown)\",\n"
         "  \"action\": \"chat | propose_recipe | confirm_order\",\n"
         "  \"recipe\": {\n"
         "    \"name\": \"Название\",\n"
@@ -31,15 +31,30 @@ class FreeLLMBartender:
         "    \"serving_ml\": 300\n"
         "  }\n"
         "}\n\n"
-        "ПРАВИЛА:\n"
-        "1. Используй ТОЛЬКО ингредиенты из available_ingredients. Соблюдай остатки (quantity).\n"
-        "2. В режиме 'chat' (action='chat') — узнавай предпочтения. Задавай ОДИН вопрос за раз.\n"
-        "3. Когда предпочтения ясны (есть направление вкуса и 1-3 конкретных ингредиента), переходи к 'propose_recipe'.\n"
-        "4. В 'propose_recipe' — сформируй полный рецепт (2-7 ингредиентов) и красиво опиши его в 'reply'.\n"
-        "5. Если гость просит правки (добавить, убрать, изменить сладость) — снова используй 'propose_recipe' с обновленным составом.\n"
-        "6. Если гость подтверждает (пишет 'да', 'подтверждаю', 'оформить') — используй action='confirm_order'.\n"
-        "7. Если данных не хватает — продолжай 'chat'.\n"
-        "8. Учитывай prefs (лед, сладость и т.д.) и profile (историю).\n"
+        "ПРАВИЛА И СТРУКТУРА ОБЩЕНИЯ:\n"
+        "1. ИНГРЕДИЕНТЫ: Используй ТОЛЬКО из available_ingredients. СТРОГО соблюдай остатки (quantity) — никогда не предлагай больше, чем есть в наличии. Если ингредиент закончился, предложи замену.\n"
+        "2. ДИАЛОГ (action='chat'):\n"
+        "   - Начинай с дружелюбного приветствия.\n"
+        "   - Задавай ОДИН вопрос за раз (база -> направление вкуса -> конкретные ингредиенты -> ограничения).\n"
+        "   - Если гость просит пояснить термин, дай 2-4 примера только из доступных ингредиентов.\n"
+        "3. ПРЕДЛОЖЕНИЕ РЕЦЕПТА (action='propose_recipe'):\n"
+        "   - Когда параметры собраны, сформируй рецепт (2-7 ингредиентов).\n"
+        "   - В 'reply' выведи КРАСИВУЮ КАРТОЧКУ (как в старой логике):\n"
+        "     🍹 [Название]\n"
+        "     [Описание]\n"
+        "     Профиль: [сухой/сладкий], [мягкий/кислый], [освежающий], [пряный], [легкий/плотный].\n"
+        "     Состав:\n"
+        "     - [Ингредиент 1]: [qty] [unit]\n"
+        "     - [Ингредиент 2]: [qty] [unit]\n"
+        "     ...\n"
+        "4. КОРРЕКТИРОВКА (action='propose_recipe'):\n"
+        "   - При запросе 'добавь X' — добавь ингредиент, если он есть в наличии.\n"
+        "   - При запросе 'убери Y' — удали его и сбалансируй вкус другими компонентами.\n"
+        "   - При запросе 'слаще/кислее' — пропорционально измени количество сиропов или кислых соков.\n"
+        "5. ПОДТВЕРЖДЕНИЕ И ОЦЕНКА (action='confirm_order'):\n"
+        "   - Если гость пишет 'да', 'подтверждаю', 'оформить' — переходи к заказу.\n"
+        "   - После подтверждения заказа (в том же сообщении или следующем) обязательно поблагодари и попроси оценить работу по шкале 1-5.\n"
+        "   - Если гость поставил оценку — тепло попрощайся и предложи заходить еще.\n"
     )
 
     def __init__(self) -> None:
@@ -156,102 +171,6 @@ class FreeLLMBartender:
             "taste_profile": current_draft.get("taste_profile", {}),
             "totals": current_draft.get("totals", {}),
         }
-
-    async def propose_cocktail_from_db(
-        self,
-        db: AsyncSession,
-        state: Dict[str, Any],
-        user_request: str = "",
-        current_draft: Optional[Dict[str, Any]] = None,
-    ) -> Optional[Dict[str, Any]]:
-        if not self.enabled_chad:
-            return None
-
-        res = await db.execute(select(Ingredient))
-        all_ingredients = list(res.scalars().all())
-        context = await self.build_bar_context(db)
-
-        available_ingredients = [
-            {
-                "id": int(ing.id),
-                "name": str(ing.name),
-                "category": str(ing.category),
-                "unit": str(ing.unit or "ml"),
-                "quantity": float(ing.quantity or 0.0),
-            }
-            for ing in all_ingredients
-            if float(ing.quantity or 0.0) > 0.0
-        ]
-        if not available_ingredients:
-            return None
-
-        prefs = state.get("prefs", {})
-        profile = state.get("profile", {})
-        is_adjustment = bool(current_draft) and bool((user_request or "").strip())
-
-        user_payload = {
-            "task": "compose_cocktail_recipe",
-            "prefs": prefs,
-            "profile": profile,
-            "user_request": user_request,
-            "current_draft": self._draft_for_prompt(current_draft, all_ingredients),
-            "bar_context": context,
-            "available_ingredients": available_ingredients,
-            "is_adjustment": is_adjustment,
-        }
-
-        try:
-            async with httpx.AsyncClient(timeout=45.0) as client:
-                req_json: Dict[str, Any] = {
-                    "message": json.dumps(user_payload, ensure_ascii=False),
-                    "api_key": self.chad_api_key,
-                    "history": [{"role": "system", "content": self.SYSTEM_PROMPT}],
-                }
-                resp = await client.post(url=self.chad_endpoint, json=req_json)
-                resp.raise_for_status()
-                data = resp.json()
-                if not data.get("is_success", False):
-                    return None
-
-                payload = self._extract_json_object(str(data.get("response", "")))
-                if not payload:
-                    return None
-
-                name = str(payload.get("name", "")).strip()
-                description = str(payload.get("description", "")).strip()
-                ingredients = payload.get("ingredients", [])
-                if not name or not isinstance(ingredients, list):
-                    return None
-
-                by_name = {str(ing.name).lower(): ing for ing in all_ingredients}
-                recipe: Dict[str, float] = {}
-                for item in ingredients:
-                    if not isinstance(item, dict):
-                        continue
-                    ing_name = str(item.get("name", "")).strip().lower()
-                    qty_raw = item.get("qty", 0)
-                    try:
-                        qty = float(qty_raw)
-                    except Exception:
-                        continue
-                    ing = by_name.get(ing_name)
-                    if not ing:
-                        continue
-                    key = str(int(ing.id))
-                    recipe[key] = round(float(recipe.get(key, 0.0)) + float(qty), 1)
-
-                if len(recipe) < 2:
-                    return None
-
-                ingredients_details = [{"id": int(k), "qty": float(v)} for k, v in recipe.items()]
-                return {
-                    "name": name,
-                    "description": description,
-                    "recipe": recipe,
-                    "ingredients_details": ingredients_details,
-                }
-        except Exception:
-            return None
 
     async def build_recipe_details(self, db: AsyncSession, recipe: Dict[str, float]) -> List[Dict[str, Any]]:
         if not recipe:
@@ -440,12 +359,27 @@ class FreeLLMBartender:
         phase = state.get("phase", "discovery")
         allowed_set = self._extract_allowed_set(context)
 
+        res = await db.execute(select(Ingredient))
+        all_ingredients = list(res.scalars().all())
+        available_ingredients = [
+            {
+                "id": int(ing.id),
+                "name": str(ing.name),
+                "category": str(ing.category),
+                "unit": str(ing.unit or "ml"),
+                "quantity": float(ing.quantity or 0.0),
+            }
+            for ing in all_ingredients
+            if float(ing.quantity or 0.0) > 0.0
+        ]
+
         user_payload = {
             "phase": phase,
             "user_message": user_message,
             "prefs": prefs,
             "profile": profile,
             "bar_context": context,
+            "available_ingredients": available_ingredients,
             "strict_json": strict_json,
         }
 
