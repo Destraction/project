@@ -62,8 +62,8 @@ class FreeLLMBartender:
     def __init__(self) -> None:
         self.enabled_chad = bool(getattr(settings, "ENABLE_CHAD", False)) and bool(getattr(settings, "CHAD_API_KEY", ""))
         self.chad_api_key = getattr(settings, "CHAD_API_KEY", "")
-        self.chad_model = getattr(settings, "CHAD_MODEL", "deepseek-v3")
-        self.chad_endpoint = "https://ask.chadgpt.ru/api/public/deepseek-v3"
+        self.chad_model = getattr(settings, "CHAD_MODEL", "deepseek-v3.2")
+        self.chad_endpoint = f"https://ask.chadgpt.ru/api/public/{self.chad_model}"
 
         self.min_required_by_unit = {"ml": 30.0, "g": 10.0, "piece": 1.0}
 
