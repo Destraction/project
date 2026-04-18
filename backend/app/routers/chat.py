@@ -90,7 +90,12 @@ async def websocket_endpoint(
 ):
     await manager.connect(session_id, websocket)
     llm = FreeLLMBartender()
-    SESSION_STATE[session_id] = _new_state()
+    
+    # Инициализируем состояние, если его еще нет
+    if session_id not in SESSION_STATE:
+        SESSION_STATE[session_id] = _new_state()
+    
+    state_obj = SESSION_STATE[session_id]
 
     async def process_llm_response(user_msg: str, state_obj: Dict[str, Any]) -> None:
         try:
@@ -105,10 +110,20 @@ async def websocket_endpoint(
                 timeout=30.0,
             )
             
+            # Пытаемся найти JSON в ответе, если модель добавила лишний текст
             try:
                 data = json.loads(raw_response)
             except:
-                data = {"reply": raw_response, "action": "chat"}
+                # Поиск JSON структуры внутри строки
+                import re
+                match = re.search(r'\{.*\}', raw_response, re.DOTALL)
+                if match:
+                    try:
+                        data = json.loads(match.group())
+                    except:
+                        data = {"reply": raw_response, "action": "chat"}
+                else:
+                    data = {"reply": raw_response, "action": "chat"}
 
             reply_text = data.get("reply", "")
             action = data.get("action", "chat")
@@ -138,8 +153,14 @@ async def websocket_endpoint(
                     state_obj["draft"] = full_draft
                     state_obj["phase"] = "draft_ready"
                     
-                    await manager.send_message(session_id, json.dumps({"type": "assistant", "content": reply_text}))
-                    await manager.send_message(session_id, json.dumps({"type": "recommendation", "message": reply_text, "draft": full_draft}))
+                    # Отправляем ТОЛЬКО ОДНО сообщение типа recommendation.
+                    # В message передаем весь текст от ИИ (с карточкой), а в draft - данные для фронтенда.
+                    # Фронтенд увидит это как одно сообщение с кнопками/структурой.
+                    await manager.send_message(session_id, json.dumps({
+                        "type": "recommendation", 
+                        "message": reply_text,
+                        "draft": full_draft
+                    }))
                     await save_dialogue_message(db, session_id, "assistant", f"{reply_text}\n(Рецепт: {full_draft['name']})")
                     return
 
@@ -174,8 +195,9 @@ async def websocket_endpoint(
             print(f"Error in process_llm_response: {e}")
             await manager.send_message(session_id, json.dumps({"type": "assistant", "content": "Прости, я немного отвлекся. Что ты говорил?"}))
 
-    # Приветствие
-    await process_llm_response("Начни диалог как бармен.", SESSION_STATE[session_id])
+    # Приветствие только если сессия новая
+    if not state_obj.get("profile", {}).get("notes"):
+        await process_llm_response("Начни диалог как бармен.", state_obj)
 
     try:
         while True:
@@ -186,25 +208,33 @@ async def websocket_endpoint(
                 continue
 
             await save_dialogue_message(db, session_id, "user", user_msg)
-            state = SESSION_STATE.get(session_id) or _new_state()
-            _remember_user_message(state, user_msg)
+            _remember_user_message(state_obj, user_msg)
             
-            if state["phase"] == "awaiting_rating":
+            if state_obj["phase"] == "awaiting_rating":
                 rating_raw = user_msg.strip()
-                if rating_raw.isdigit() and 1 <= int(rating_raw) <= 5:
-                    from app.models import Feedback
-                    feedback = Feedback(order_id=state["pending_order_id"], rating=int(rating_raw), comment=user_msg)
-                    db.add(feedback)
-                    await db.commit()
-                    state["phase"] = "discovery"
-                    state["draft"] = None
-                    await process_llm_response(f"Гость поставил оценку {rating_raw}. Поблагодари и предложи что-нибудь еще.", state)
-                    continue
+                # Пытаемся найти цифру в ответе
+                rating_match = re.search(r'[1-5]', rating_raw)
+                rating_val = int(rating_match.group()) if rating_match else None
+                
+                from app.models import Feedback
+                feedback = Feedback(order_id=state_obj["pending_order_id"], rating=rating_val, comment=user_msg)
+                db.add(feedback)
+                await db.commit()
+                
+                state_obj["phase"] = "discovery"
+                state_obj["draft"] = None
+                
+                # Прямой ответ без вызова LLM для этапа оценки, чтобы избежать ошибок "Я немного задумался"
+                thanks_text = "Спасибо за вашу оценку! Рад был помочь. Если захотите попробовать что-то еще — я всегда здесь, у барной стойки!"
+                await manager.send_message(session_id, json.dumps({"type": "assistant", "content": thanks_text}))
+                await save_dialogue_message(db, session_id, "assistant", thanks_text)
+                continue
 
-            await process_llm_response(user_msg, state)
+            await process_llm_response(user_msg, state_obj)
 
     except WebSocketDisconnect:
         pass
     finally:
-        SESSION_STATE.pop(session_id, None)
+        # Не удаляем сессию сразу, чтобы она сохранялась при переподключении
+        # SESSION_STATE.pop(session_id, None) 
         manager.disconnect(session_id)

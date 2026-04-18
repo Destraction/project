@@ -47,6 +47,8 @@ class FreeLLMBartender:
         "     - [Ингредиент 1]: [qty] [unit]\n"
         "     - [Ингредиент 2]: [qty] [unit]\n"
         "     ...\n"
+        "     Если хотите, я изменю состав: напишите 'добавь X', 'убери Y', 'сделай слаще/кислее' или 'без льда'.\n"
+        "     Либо напишите 'подтвердить', чтобы оформить заказ.\n"
         "4. КОРРЕКТИРОВКА (action='propose_recipe'):\n"
         "   - При запросе 'добавь X' — добавь ингредиент, если он есть в наличии.\n"
         "   - При запросе 'убери Y' — удали его и сбалансируй вкус другими компонентами.\n"
@@ -60,8 +62,8 @@ class FreeLLMBartender:
     def __init__(self) -> None:
         self.enabled_chad = bool(getattr(settings, "ENABLE_CHAD", False)) and bool(getattr(settings, "CHAD_API_KEY", ""))
         self.chad_api_key = getattr(settings, "CHAD_API_KEY", "")
-        self.chad_model = getattr(settings, "CHAD_MODEL", "gpt-5.4-mini")
-        self.chad_endpoint = f"https://ask.chadgpt.ru/api/public/{self.chad_model}"
+        self.chad_model = getattr(settings, "CHAD_MODEL", "deepseek-v3")
+        self.chad_endpoint = "https://ask.chadgpt.ru/api/public/deepseek-v3"
 
         self.min_required_by_unit = {"ml": 30.0, "g": 10.0, "piece": 1.0}
 
