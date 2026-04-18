@@ -9,22 +9,28 @@
         font-family: Arial, sans-serif;
         margin: 20px;
         color: #222;
+        background-color: #f9f9f9;
       }
       table {
         width: 100%;
         border-collapse: collapse;
         margin-top: 10px;
+        background: white;
       }
       th, td {
         border: 1px solid #ddd;
-        padding: 8px;
+        padding: 12px;
         text-align: left;
       }
       th {
         background: #f5f5f5;
       }
       .section {
-        margin-bottom: 30px;
+        margin-bottom: 40px;
+        background: white;
+        padding: 20px;
+        border-radius: 8px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
       }
       .row {
         display: flex;
@@ -44,14 +50,83 @@
         background: #2f80ed;
         color: white;
         cursor: pointer;
+        font-weight: bold;
       }
       button.secondary {
         background: #666;
       }
+      button.success {
+        background: #27ae60;
+      }
+      button.danger {
+        background: #eb5757;
+      }
+      .order-card {
+        border: 1px solid #eee;
+        padding: 15px;
+        margin-bottom: 15px;
+        border-radius: 8px;
+        background: #fff;
+      }
+      .recipe-list {
+        background: #fcfcfc;
+        padding: 10px;
+        border-radius: 4px;
+        margin: 10px 0;
+        border-left: 4px solid #2f80ed;
+      }
+      .recipe-list ul {
+        margin: 0;
+        padding-left: 20px;
+      }
     </style>
   </head>
   <body>
-    <h1>Admin - Cocktail AI</h1>
+    <h1>Панель управления баром</h1>
+
+    <script>
+      // Функция для автоматического обновления страницы каждые 10 секунд
+      // чтобы видеть новые заказы без ручной перезагрузки
+      setInterval(function() {
+        location.reload();
+      }, 10000);
+    </script>
+
+    <div class="section">
+      <h2>🔥 Активные заказы</h2>
+      {% if active_orders %}
+        {% for item in active_orders %}
+        <div class="order-card">
+          <div style="display: flex; justify-content: space-between; align-items: flex-start;">
+            <div>
+              <strong>Заказ #{{ item.order.id }}</strong> — {{ item.cocktail.name }}
+              <br>
+              <small>Сессия: {{ item.order.session_id }}</small>
+            </div>
+            <div class="row">
+              <form method="post" action="/admin/order/{{ item.order.id }}/complete">
+                <button type="submit" class="success">Готово</button>
+              </form>
+              <form method="post" action="/admin/order/{{ item.order.id }}/cancel">
+                <button type="submit" class="danger">Отменить</button>
+              </form>
+            </div>
+          </div>
+          
+          <div class="recipe-list">
+            <strong>Состав:</strong>
+            <ul>
+              {% for line in item.recipe_display %}
+                <li>{{ line }}</li>
+              {% endfor %}
+            </ul>
+          </div>
+        </div>
+        {% endfor %}
+      {% else %}
+        <p>Нет активных заказов</p>
+      {% endif %}
+    </div>
 
     <div class="section">
       <h2>Ингредиенты</h2>
