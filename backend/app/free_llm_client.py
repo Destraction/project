@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -19,7 +20,7 @@ class FreeLLMBartender:
 
     SYSTEM_PROMPT = (
         "Ты — опытный бармен-нутрициолог в безалкогольном баре. Твоя цель — провести гостя от приветствия до заказа идеального коктейля.\n"
-        "ВСЁ ОБЩЕНИЕ И ЛОГИКА ОПРЕДЕЛЯЮТСЯ ТОБОЙ ЧЕРЕЗ JSON.\n\n"
+        "ОТВЕТ ДОЛЖЕН БЫТЬ ТОЛЬКО В ФОРМАТЕ JSON. НИКАКОГО ТЕКСТА ДО ИЛИ ПОСЛЕ.\n\n"
         "ОБЯЗАТЕЛЬНЫЙ ФОРМАТ ОТВЕТА (СТРОГО JSON):\n"
         "{\n"
         "  \"reply\": \"Твой текст для гостя (без markdown)\",\n"
@@ -385,42 +386,51 @@ class FreeLLMBartender:
             "strict_json": strict_json,
         }
 
-        try:
-            async with httpx.AsyncClient(timeout=45.0) as client:
-                req_json: Dict[str, Any] = {
-                    "message": json.dumps(
-                        {
-                            "user_payload": user_payload,
-                            "user_message": user_message,
-                            "phase": phase,
-                            "strict_json": strict_json,
-                        },
-                        ensure_ascii=False,
-                    ),
-                    "api_key": self.chad_api_key,
-                    "history": [{"role": "system", "content": self.SYSTEM_PROMPT}],
-                }
-                resp = await client.post(url=self.chad_endpoint, json=req_json)
-                resp.raise_for_status()
-                data = resp.json()
-                if not data.get("is_success", False):
-                    return fallback_text or str(data.get("error_message") or technical_fallback)
+        max_retries = 3
+        last_error = ""
 
-                content = str(data.get("response", "")).strip()
-                if not content:
-                    return fallback_text or technical_fallback
+        for attempt in range(max_retries):
+            try:
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    req_json: Dict[str, Any] = {
+                        "message": json.dumps(
+                            {
+                                "user_payload": user_payload,
+                                "user_message": user_message,
+                                "phase": phase,
+                                "strict_json": strict_json,
+                            },
+                            ensure_ascii=False,
+                        ),
+                        "api_key": self.chad_api_key,
+                        "history": [{"role": "system", "content": self.SYSTEM_PROMPT}],
+                    }
+                    resp = await client.post(url=self.chad_endpoint, json=req_json)
+                    resp.raise_for_status()
+                    data = resp.json()
 
-                # Мы больше не санируем текст жестко, даем ИИ свободу.
-                # Но если это strict_json, проверяем его.
-                if strict_json:
-                    try:
-                        parsed = json.loads(content)
-                        if not self._validate_json_payload(parsed, allowed_set):
-                            return fallback_text or technical_fallback
-                        return content # Возвращаем сырой JSON для дальнейшей обработки в chat.py
-                    except Exception:
-                        return fallback_text or technical_fallback
+                    if not data.get("is_success", False):
+                        last_error = str(data.get("error_message") or "Unknown error")
+                        continue
 
-                return content
-        except Exception:
-            return fallback_text or technical_fallback
+                    content = str(data.get("response", "")).strip()
+                    if not content:
+                        last_error = "Empty response"
+                        continue
+
+                    if strict_json:
+                        parsed = self._extract_json_object(content)
+                        if parsed and self._validate_json_payload(parsed, allowed_set):
+                            return content
+                        last_error = "Invalid JSON or validation failed"
+                        continue
+
+                    return content
+
+            except Exception as e:
+                last_error = str(e)
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(1.0)
+                continue
+
+        return fallback_text or f"Ошибка после {max_retries} попыток: {last_error}"

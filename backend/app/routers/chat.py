@@ -107,7 +107,7 @@ async def websocket_endpoint(
                     fallback_text="Я немного задумался, повтори, пожалуйста.",
                     strict_json=True,
                 ),
-                timeout=30.0,
+                timeout=60.0,
             )
             
             # Пытаемся найти JSON в ответе, если модель добавила лишний текст
@@ -115,14 +115,15 @@ async def websocket_endpoint(
                 data = json.loads(raw_response)
             except:
                 # Поиск JSON структуры внутри строки
-                import re
                 match = re.search(r'\{.*\}', raw_response, re.DOTALL)
                 if match:
                     try:
                         data = json.loads(match.group())
                     except:
+                        # Если даже после извлечения не JSON - используем как текст (Fallback)
                         data = {"reply": raw_response, "action": "chat"}
                 else:
+                    # Если JSON вообще не найден - используем сырой ответ как текст (Fallback)
                     data = {"reply": raw_response, "action": "chat"}
 
             reply_text = data.get("reply", "")
