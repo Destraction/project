@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "Bash(curl -L -o \"/Users/imarkov/Projects/Diploma/Diplom_lit/Wu_2023_Survey_LLM_RecSys.pdf\" \"https://arxiv.org/pdf/2306.05817\" --max-time 60 -s -w \"2306.05817: %{size_download}B HTTP:%{http_code}\\\\n\")",
+      "Bash(curl -L -o \"/Users/imarkov/Projects/Diploma/Diplom_lit/Lin_2024_LLM_Enhanced_RecSys_Survey.pdf\" \"https://arxiv.org/pdf/2412.13432\" --max-time 60 -s -w \"2412.13432: %{size_download}B HTTP:%{http_code}\\\\n\")",
+      "Bash(curl -L -o \"/Users/imarkov/Projects/Diploma/Diplom_lit/Fan_2023_Survey_LLM_Recommendation.pdf\" \"https://arxiv.org/pdf/2305.19860\" --max-time 60 -s -w \"2305.19860: %{size_download}B HTTP:%{http_code}\\\\n\")",
+      "Bash(python3 -c ' *)"
+    ],
+    "defaultMode": "bypassPermissions"
+  }
+}
